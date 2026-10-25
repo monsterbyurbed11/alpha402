@@ -16,9 +16,9 @@ app.use('*', cors());
 app.get('/', (c) => {
   return c.json({
     name: 'Alpha402 - Agent On-Chain Alpha API',
-    version: '1.3.0',
-    description: 'Fail-closed, anti-honeypot, wash-trading filtered on-chain alpha signals with atomic nonce rollback for AI agents.',
-    paymentProtocol: 'HTTP 402 (L402 / x402)',
+    version: '1.4.0',
+    description: 'Cryptographically and RPC-verified, fail-closed on-chain alpha engine for autonomous AI agents.',
+    paymentProtocol: 'HTTP 402 (Base USDC on-chain verified / L402 Lightning SHA-256)',
     endpoints: {
       mcp: '/mcp',
       tokenAlpha: '/v1/token-alpha?network=base&address=0x...',
@@ -28,7 +28,7 @@ app.get('/', (c) => {
     },
     scoringFormula: {
       formula: 'AlphaScore = (Security * 0.40) + (Momentum * 0.35) + (Liquidity * 0.25)',
-      failSafe: 'Fail-closed: If audit fails/times out, alphaScore is NULL, isHoneypot is NULL, and nonce is DEL released (reusable credit).',
+      failSafe: 'Fail-closed: If audit fails/times out, returns 503, data is withheld, and nonce is DEL released (reusable credit).',
       washTradingFilter: 'Momentum is zeroed (0 pts) if wash trading is flagged; pools < 24h old get momentum discounted by poolAgeHours/24.',
       ownerPermissions: 'ownerCanChangeBalance === true hard-zeros alphaScore to 0.',
     },
@@ -43,15 +43,15 @@ app.get('/.well-known/agent.json', (c) => {
     name_for_model: 'alpha402_onchain_intelligence',
     name_for_human: 'Alpha402 On-Chain Alpha',
     description_for_model:
-      'Provides fail-closed token momentum, liquidity depth, anti-honeypot contract security audits (weighted 40% security, 35% momentum, 25% liquidity, pool-age dampened), and Polymarket spreads for autonomous trading agents. Returns alphaScore: null and releases payment proof as reusable credit on audit failures. Costs $0.02 USDC or 20 sats per request via HTTP 402.',
+      'Provides fail-closed token momentum, liquidity depth, anti-honeypot contract security audits (weighted 40% security, 35% momentum, 25% liquidity, pool-age dampened), and Polymarket spreads for autonomous trading agents. Returns 503 and releases payment proof as reusable credit on audit failures. Costs $0.02 USDC on Base or 20 sats via HTTP 402.',
     auth: {
       type: 'http_402',
-      protocols: ['L402', 'x402'],
+      protocols: ['x402', 'L402'],
     },
     tools: [
       {
         name: 'getTokenAlpha',
-        description: 'Analyzes contract security (fails closed on audit errors with null score and nonce release), volume spikes, and liquidity for any token.',
+        description: 'Analyzes contract security (fails closed on audit errors with reusable credit), volume spikes, and liquidity for any token.',
         parameters: {
           type: 'object',
           properties: {
@@ -106,7 +106,7 @@ app.get('/mcp', (c) => {
   return c.json({
     status: 'ready',
     service: 'alpha402-mcp-server',
-    version: '1.3.0',
+    version: '1.4.0',
     capabilities: { tools: true },
     tools: MCP_TOOLS,
   });
@@ -126,7 +126,7 @@ app.post('/mcp', async (c) => {
           capabilities: { tools: {} },
           serverInfo: {
             name: 'alpha402-intelligence-mcp',
-            version: '1.3.0',
+            version: '1.4.0',
           },
         },
       });
@@ -212,16 +212,16 @@ app.get('/openapi.json', (c) => {
     openapi: '3.1.0',
     info: {
       title: 'Alpha402 Intelligence API',
-      version: '1.3.0',
+      version: '1.4.0',
       description:
-        'HTTP 402 micro-payment on-chain alpha and security engine. Features atomic nonce rollback on audit failures (reusable credit) and pool-age dampened momentum.',
+        'HTTP 402 micro-payment on-chain alpha and security engine. Features on-chain RPC verification for Base USDC, atomic nonce rollback on audit failures (reusable credit, no free data leak), and pool-age dampened momentum.',
     },
     paths: {
       '/v1/token-alpha': {
         get: {
           summary: 'Get Token Alpha & Security Audit',
           description:
-            'Fetches live price, liquidity depth, 5m/1h volume momentum, and contract safety audit. Fails closed if audit is unavailable (alphaScore: null, reusableCredit: true).',
+            'Fetches live price, liquidity depth, 5m/1h volume momentum, and contract safety audit. Fails closed with 503 if audit is unavailable (reusableCredit: true, data withheld).',
           parameters: [
             {
               name: 'address',
@@ -236,13 +236,6 @@ app.get('/openapi.json', (c) => {
               required: false,
               description: 'Blockchain network',
               schema: { type: 'string', enum: ['base', 'solana', 'ethereum', 'bsc', 'arbitrum', 'polygon'], default: 'base' },
-            },
-            {
-              name: 'demo',
-              in: 'query',
-              required: false,
-              description: 'Set to true for free testing sandbox',
-              schema: { type: 'boolean' },
             },
           ],
           responses: {
@@ -262,6 +255,16 @@ app.get('/openapi.json', (c) => {
                 'application/json': {
                   schema: {
                     $ref: '#/components/schemas/PaymentRequiredResponse',
+                  },
+                },
+              },
+            },
+            '503': {
+              description: 'Audit service unavailable - payment proof released as reusable credit',
+              content: {
+                'application/json': {
+                  schema: {
+                    $ref: '#/components/schemas/AuditUnavailableResponse',
                   },
                 },
               },
@@ -303,9 +306,9 @@ app.get('/openapi.json', (c) => {
           type: 'object',
           properties: {
             success: { type: 'boolean' },
-            charged: { type: 'boolean', description: 'False if audit failed or was unavailable' },
-            reusableCredit: { type: 'boolean', description: 'True if nonce was DEL released and credit is reusable' },
-            paymentVerifiedBy: { type: 'string', example: 'x402_Base_USDC' },
+            charged: { type: 'boolean', description: 'True when service successfully fulfilled the audit' },
+            reusableCredit: { type: 'boolean', description: 'False when charged' },
+            paymentVerifiedBy: { type: 'string', example: 'x402_Base_USDC_OnChain_Verified' },
             data: {
               type: 'object',
               properties: {
@@ -322,7 +325,7 @@ app.get('/openapi.json', (c) => {
                   type: ['number', 'null'],
                   minimum: 0,
                   maximum: 100,
-                  description: 'Composite alpha score. NULL if upstream audit was unavailable (Fail-closed). 0 if honeypot or balance modification risk.',
+                  description: 'Composite alpha score. 0 if honeypot or balance modification risk.',
                 },
                 riskLevel: { type: 'string', enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL', 'UNKNOWN'] },
                 signals: {
@@ -334,8 +337,8 @@ app.get('/openapi.json', (c) => {
                     buyPressureRatio1h: { type: 'number' },
                     volumeSpike5mVs1hAvg: { type: 'number' },
                     poolAgeHours: { type: ['number', 'null'] },
-                    poolAgeDiscountApplied: { type: 'number', description: 'Multiplier (0.1 to 1.0) applied to momentum based on pool age' },
-                    possibleWashTrading: { type: 'boolean', description: 'True if volume spike appears artificial' },
+                    poolAgeDiscountApplied: { type: 'number' },
+                    possibleWashTrading: { type: 'boolean' },
                   },
                 },
                 marketSummary: {
@@ -353,11 +356,11 @@ app.get('/openapi.json', (c) => {
                   type: 'object',
                   properties: {
                     auditStatus: { type: 'string', enum: ['VERIFIED', 'UNAVAILABLE', 'TIMEOUT', 'ERROR'] },
-                    isHoneypot: { type: ['boolean', 'null'], description: 'Null if audit failed (fail-closed)' },
-                    buyTax: { type: 'number', description: 'Numeric percentage, e.g. 5.0 for 5%' },
-                    sellTax: { type: 'number', description: 'Numeric percentage, e.g. 5.0 for 5%' },
-                    buyTaxBps: { type: 'number', description: 'Basis points, e.g. 500 for 5%' },
-                    sellTaxBps: { type: 'number', description: 'Basis points, e.g. 500 for 5%' },
+                    isHoneypot: { type: ['boolean', 'null'] },
+                    buyTax: { type: 'number' },
+                    sellTax: { type: 'number' },
+                    buyTaxBps: { type: 'number' },
+                    sellTaxBps: { type: 'number' },
                     isOpenSource: { type: 'boolean' },
                     warnings: { type: 'array', items: { type: 'string' } },
                   },
@@ -376,10 +379,22 @@ app.get('/openapi.json', (c) => {
                     vetoConditions: { type: 'array', items: { type: 'string' } },
                   },
                 },
-                agentActionableSummary: { type: 'string', description: 'Dense decision prompt for LLM trading decisions' },
+                agentActionableSummary: { type: 'string' },
                 timestamp: { type: 'string', format: 'date-time' },
               },
             },
+          },
+        },
+        AuditUnavailableResponse: {
+          type: 'object',
+          properties: {
+            success: { type: 'boolean', example: false },
+            error: { type: 'string', example: 'Security audit unavailable or timed out. Failing closed.' },
+            auditStatus: { type: 'string', example: 'UNAVAILABLE' },
+            reusableCredit: { type: 'boolean', example: true },
+            charged: { type: 'boolean', example: false },
+            message: { type: 'string' },
+            data: { type: 'null' },
           },
         },
         PaymentRequiredResponse: {
@@ -397,15 +412,6 @@ app.get('/openapi.json', (c) => {
             paymentOptions: {
               type: 'object',
               properties: {
-                l402: {
-                  type: 'object',
-                  properties: {
-                    protocol: { type: 'string', example: 'Lightning Network' },
-                    token: { type: 'string' },
-                    invoice: { type: 'string' },
-                    settleFormat: { type: 'string' },
-                  },
-                },
                 x402: {
                   type: 'object',
                   properties: {
@@ -413,7 +419,16 @@ app.get('/openapi.json', (c) => {
                     network: { type: 'string', example: 'base' },
                     amountUsdc: { type: 'number', example: 0.02 },
                     recipient: { type: 'string' },
-                    settleFormat: { type: 'string' },
+                    settleFormat: { type: 'string', example: 'Authorization: x402 <transaction_hash>' },
+                  },
+                },
+                l402: {
+                  type: 'object',
+                  properties: {
+                    protocol: { type: 'string', example: 'Lightning Network' },
+                    token: { type: 'string' },
+                    invoice: { type: 'string' },
+                    settleFormat: { type: 'string', example: 'Authorization: L402 <token>:<preimage>' },
                   },
                 },
               },
@@ -468,8 +483,10 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
     await releaseNonce(c);
     return c.json(
       {
+        success: false,
         error: `No active liquidity pools found for address ${address} on network ${network}.`,
         reusableCredit: true,
+        charged: false,
         suggestion: 'Verify the token contract address. Your payment proof remains valid and reusable.',
       },
       404
@@ -481,17 +498,31 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
 
   const isAuditVerified = securityReport.auditStatus === 'VERIFIED';
 
-  // If the upstream security audit failed, release the nonce key so the proof is a reusable credit
+  // CRITICAL FAIL-CLOSED & ANTI-EXPLOIT:
+  // If audit failed, release the nonce key so proof is reusable, BUT WITHHOLD DATA!
+  // No free data leak for unindexed tokens.
   if (!isAuditVerified) {
     await releaseNonce(c);
+    return c.json(
+      {
+        success: false,
+        error: 'Security audit unavailable or timed out. Failing closed.',
+        auditStatus: securityReport.auditStatus,
+        reusableCredit: true,
+        charged: false,
+        message: 'Upstream audit failed. Payment proof was NOT consumed and remains a reusable credit. Data withheld to prevent unverified trading.',
+        data: null,
+      },
+      503
+    );
   }
 
   const alphaResult = computeAlphaSignal(network, dexData, securityReport);
 
   return c.json({
     success: true,
-    charged: isAuditVerified,
-    reusableCredit: !isAuditVerified, // Nonce was DEL released on failure
+    charged: true,
+    reusableCredit: false,
     paymentVerifiedBy: c.get('paymentType'),
     data: alphaResult,
   });
