@@ -1,0 +1,8 @@
+startCommand:
+  type: stdio
+  config:
+    command: "npx"
+    args:
+      - "-y"
+      - "tsx"
+      - "src/mcp/server.ts"
