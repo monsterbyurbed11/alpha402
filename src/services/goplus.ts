@@ -23,16 +23,22 @@ export async function fetchSecurityReport(network: Network, tokenAddress: string
       url = `https://api.gopluslabs.io/api/v1/token_security/${chainId}?contract_addresses=${tokenAddress.toLowerCase()}`;
     }
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000); // 4-second strict timeout
+
     const res = await fetch(url, {
+      signal: controller.signal,
       headers: {
         'Accept': 'application/json',
         'User-Agent': 'Alpha402-Security-Scanner/1.0'
       }
     });
 
+    clearTimeout(timeout);
+
     if (!res.ok) {
-      warnings.push(`Security check service returned ${res.status}`);
-      return createFallbackReport(warnings);
+      warnings.push(`AUDIT_UNAVAILABLE: Security provider responded with HTTP ${res.status}. Failing closed.`);
+      return createFailClosedReport('UNAVAILABLE', warnings);
     }
 
     const data: any = await res.json();
@@ -40,8 +46,8 @@ export async function fetchSecurityReport(network: Network, tokenAddress: string
     const details = resultObj[tokenAddress.toLowerCase()] || resultObj[tokenAddress] || {};
 
     if (!details || Object.keys(details).length === 0) {
-      warnings.push('No audit records found on GoPlus security index.');
-      return createFallbackReport(warnings);
+      warnings.push('AUDIT_UNAVAILABLE: No audit records found for token. Contract is unindexed.');
+      return createFailClosedReport('UNAVAILABLE', warnings);
     }
 
     const isHoneypot = details.is_honeypot === '1';
@@ -103,6 +109,7 @@ export async function fetchSecurityReport(network: Network, tokenAddress: string
     }
 
     return {
+      auditStatus: 'VERIFIED',
       isHoneypot,
       buyTax,
       sellTax,
@@ -117,24 +124,30 @@ export async function fetchSecurityReport(network: Network, tokenAddress: string
       warnings,
     };
   } catch (err: any) {
-    warnings.push(`Security check error: ${err.message}`);
-    return createFallbackReport(warnings);
+    const isTimeout = err.name === 'AbortError';
+    warnings.push(isTimeout ? 'AUDIT_TIMEOUT: Security check timed out after 4s. Failing closed.' : `AUDIT_ERROR: ${err.message}. Failing closed.`);
+    return createFailClosedReport(isTimeout ? 'TIMEOUT' : 'ERROR', warnings);
   }
 }
 
-function createFallbackReport(warnings: string[]): SecurityReport {
+/**
+ * Fail-Closed Safe Fallback
+ * Never assumes a contract is safe when upstream audit is down or unindexed.
+ */
+function createFailClosedReport(status: 'UNAVAILABLE' | 'TIMEOUT' | 'ERROR', warnings: string[]): SecurityReport {
   return {
-    isHoneypot: false,
+    auditStatus: status,
+    isHoneypot: null, // Explicitly NULL (Unknown), NEVER false
     buyTax: 0,
     sellTax: 0,
-    isOpenSource: true,
+    isOpenSource: false,
     cannotSellAll: false,
     ownerCanChangeBalance: false,
     isMintable: false,
     isBlacklisted: false,
     creatorPercent: 0,
     topHoldersPercent: 0,
-    riskCount: 1,
+    riskCount: 8, // Substantial risk penalty for unverified contracts
     warnings,
   };
 }

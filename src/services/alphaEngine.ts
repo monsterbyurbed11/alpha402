@@ -5,11 +5,17 @@ export function computeAlphaSignal(
   dexData: DexPairData,
   security: SecurityReport
 ): TokenAlphaSignal {
+  const isAuditVerified = security.auditStatus === 'VERIFIED';
+
   // 1. Security Score (0 - 100)
   let securityScore = 100;
-  if (security.isHoneypot) securityScore = 0;
-  else if (security.ownerCanChangeBalance) securityScore = 5;
-  else {
+  if (!isAuditVerified) {
+    securityScore = 20; // Heavy penalty: cannot verify security
+  } else if (security.isHoneypot) {
+    securityScore = 0;
+  } else if (security.ownerCanChangeBalance) {
+    securityScore = 5;
+  } else {
     securityScore -= security.riskCount * 8;
     if (!security.isOpenSource) securityScore -= 20;
     if (security.buyTax > 5) securityScore -= (security.buyTax - 5) * 2;
@@ -52,30 +58,35 @@ export function computeAlphaSignal(
   if (volumeSpikeMultiplier > 2.0) momentumScore += 10;
   momentumScore = Math.max(0, Math.min(100, Math.round(momentumScore)));
 
-  // 4. Overall Alpha Score (Weighted: 40% Security, 35% Momentum, 25% Liquidity)
+  // 4. Overall Alpha Score: Weighted Sum (40% Security, 35% Momentum, 25% Liquidity)
   let alphaScore = Math.round((securityScore * 0.40) + (momentumScore * 0.35) + (liquidityScore * 0.25));
 
-  // Hard penalty for unverified / dangerous contracts
-  if (security.isHoneypot || security.ownerCanChangeBalance) {
-    alphaScore = 0;
+  // Veto conditions: Hard zero on unverified audit, confirmed honeypot, or malicious balance modification
+  const vetoTriggered = !isAuditVerified || security.isHoneypot === true || security.ownerCanChangeBalance === true;
+  if (vetoTriggered) {
+    alphaScore = Math.min(alphaScore, security.isHoneypot ? 0 : 25);
   }
 
   // 5. Determine Risk Level
   let riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' = 'LOW';
-  if (securityScore < 30 || security.isHoneypot) riskLevel = 'CRITICAL';
+  if (!isAuditVerified || security.isHoneypot || securityScore < 30) riskLevel = 'CRITICAL';
   else if (securityScore < 60 || liquidityScore < 30) riskLevel = 'HIGH';
   else if (securityScore < 80 || momentumScore < 40) riskLevel = 'MEDIUM';
 
   // 6. Generate Agent Actionable Summary (High-density prompt for LLM)
   let actionAdvice = '';
-  if (riskLevel === 'CRITICAL') {
-    actionAdvice = `REJECT / ABORT. Critical security risk (${security.warnings.join('; ')}).`;
+  if (!isAuditVerified) {
+    actionAdvice = `AUDIT_UNAVAILABLE / FAIL-CLOSED. Upstream security check failed or timed out. Do NOT assume token is safe. Pre-swap check aborted.`;
+  } else if (security.isHoneypot) {
+    actionAdvice = `REJECT / ABORT. Token confirmed as HONEYPOT. Sell is blocked!`;
+  } else if (riskLevel === 'CRITICAL') {
+    actionAdvice = `CRITICAL RISK (${security.warnings.join('; ')}). Abort transaction.`;
   } else if (riskLevel === 'HIGH') {
-    actionAdvice = `HIGH RISK. Weak liquidity ($${Math.round(liq).toLocaleString()}) or contract warnings. Only consider micro-positions.`;
+    actionAdvice = `HIGH RISK. Low liquidity ($${Math.round(liq).toLocaleString()}) or contract warnings.`;
   } else if (alphaScore > 75 && momentumScore > 70) {
-    actionAdvice = `STRONG MOMENTUM SIGNAL. Buy ratio is ${buyRatio1h.toFixed(1)}x with clean security audit. 1h price trend is +${dexData.priceChange.h1}%.`;
+    actionAdvice = `STRONG MOMENTUM SIGNAL. Buy ratio is ${buyRatio1h.toFixed(1)}x with verified security audit. 1h price trend is +${dexData.priceChange.h1}%.`;
   } else if (momentumScore < 45) {
-    actionAdvice = `MONITOR / PASS. Contract is safe, but bearish selling pressure detected (${buys1h} buys vs ${sells1h} sells in 1h).`;
+    actionAdvice = `MONITOR / PASS. Contract is safe, but selling pressure detected (${buys1h} buys vs ${sells1h} sells in 1h).`;
   } else {
     actionAdvice = `NEUTRAL / ACCUMULATING. Stable price action and verified contract. Normal liquidity depth.`;
   }
@@ -105,11 +116,24 @@ export function computeAlphaSignal(
       volume24h: Math.round(dexData.volume.h24),
     },
     securityAudit: {
+      auditStatus: security.auditStatus,
       isHoneypot: security.isHoneypot,
       buyTax: `${security.buyTax.toFixed(1)}%`,
       sellTax: `${security.sellTax.toFixed(1)}%`,
       isOpenSource: security.isOpenSource,
       warnings: security.warnings,
+    },
+    scoringMethodology: {
+      weights: {
+        securityWeight: '40%',
+        momentumWeight: '35%',
+        liquidityWeight: '25%',
+      },
+      vetoConditions: [
+        'isHoneypot === true -> AlphaScore capped at 0',
+        'ownerCanChangeBalance === true -> AlphaScore capped at 25',
+        'auditStatus !== VERIFIED -> AlphaScore capped at 25 (Fail-closed)',
+      ],
     },
     agentActionableSummary: actionAdvice,
     timestamp: new Date().toISOString(),

@@ -35,7 +35,8 @@ export interface DexPairData {
 }
 
 export interface SecurityReport {
-  isHoneypot: boolean;
+  auditStatus: 'VERIFIED' | 'UNAVAILABLE' | 'TIMEOUT' | 'ERROR';
+  isHoneypot: boolean | null;
   buyTax: number;
   sellTax: number;
   isOpenSource: boolean;
@@ -74,11 +75,20 @@ export interface TokenAlphaSignal {
     volume24h: number;
   };
   securityAudit: {
-    isHoneypot: boolean;
+    auditStatus: 'VERIFIED' | 'UNAVAILABLE' | 'TIMEOUT' | 'ERROR';
+    isHoneypot: boolean | null;
     buyTax: string;
     sellTax: string;
     isOpenSource: boolean;
     warnings: string[];
+  };
+  scoringMethodology: {
+    weights: {
+      securityWeight: '40%';
+      momentumWeight: '35%';
+      liquidityWeight: '25%';
+    };
+    vetoConditions: string[];
   };
   agentActionableSummary: string; // Tailored for LLM trading decisions
   timestamp: string;
