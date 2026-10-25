@@ -60,6 +60,42 @@ async function atomicClaimNonce(
   return true;
 }
 
+/**
+ * Rollback / Release Nonce on Provider Failure
+ * If an upstream dependency (e.g. GoPlus audit) fails, this function DELs
+ * the nonce key from Redis so the agent's payment proof remains a valid, reusable credit.
+ */
+export async function releaseNonce(c: Context): Promise<boolean> {
+  const paymentProof = c.get('paymentProof');
+  if (!paymentProof) return false;
+
+  const env = c.env || {};
+  const upstashUrl = env.UPSTASH_REDIS_REST_URL;
+  const upstashToken = env.UPSTASH_REDIS_REST_TOKEN;
+
+  if (upstashUrl && upstashToken) {
+    try {
+      // Redis command: DEL alpha402:nonce:<key>
+      const endpoint = `${upstashUrl}/del/alpha402:nonce:${paymentProof}`;
+      const res = await fetch(endpoint, {
+        headers: {
+          Authorization: `Bearer ${upstashToken}`,
+        },
+      });
+
+      if (res.ok) {
+        const data: any = await res.json();
+        return data.result > 0;
+      }
+    } catch (e) {
+      console.error('Failed to release nonce in Upstash:', e);
+    }
+  }
+
+  localSpentTokens.delete(paymentProof);
+  return true;
+}
+
 export function paywall402(config: Partial<PaywallConfig> = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
 

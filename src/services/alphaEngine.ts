@@ -10,10 +10,8 @@ export function computeAlphaSignal(
   // 1. Security Score (0 - 100 or null)
   let securityScore: number | null = null;
   if (isAuditVerified) {
-    if (security.isHoneypot === true) {
-      securityScore = 0;
-    } else if (security.ownerCanChangeBalance) {
-      securityScore = 5;
+    if (security.isHoneypot === true || security.ownerCanChangeBalance === true) {
+      securityScore = 0; // Hard zero for honeypots or balance modification
     } else {
       let score = 100 - (security.riskCount * 8);
       if (!security.isOpenSource) score -= 20;
@@ -33,26 +31,35 @@ export function computeAlphaSignal(
   else if (liq < 1000000) liquidityScore = 80 + Math.round(((liq - 250000) / 750000) * 20);
   else liquidityScore = 100;
 
-  // 3. Pool Age & Wash Trading Heuristics
+  // 3. Pool Age & Age-Graduated Discounting
   let poolAgeHours: number | null = null;
+  let poolAgeDiscountApplied = 1.0;
   if (dexData.pairCreatedAt) {
     poolAgeHours = parseFloat(((Date.now() - dexData.pairCreatedAt) / (1000 * 60 * 60)).toFixed(1));
+    // Pools < 24h old get momentum dampened proportionally to their age (e.g. 2h pool = 2/24 = 0.083 -> capped at 0.1 min)
+    poolAgeDiscountApplied = parseFloat(Math.min(1.0, Math.max(0.1, poolAgeHours / 24)).toFixed(2));
+  } else {
+    poolAgeDiscountApplied = 0.5; // Unknown creation date receives conservative 50% discount
   }
 
-  // Wash-trading heuristic:
-  // High 5m volume with very few transactions, or new pool (<2 hours) with massive spike
+  // 4. Wash-Trading Heuristics
+  // Catches: 
+  // - High 5m volume with low transaction counts (<= 3 txns)
+  // - Unusually large avg transaction size (> 15% of total pool liquidity)
+  // - Low trade count in 1h with high volume (> 2x liquidity with < 20 transactions)
   const tx5mTotal = (dexData.txns.m5.buys || 0) + (dexData.txns.m5.sells || 0);
+  const tx1hTotal = (dexData.txns.h1.buys || 0) + (dexData.txns.h1.sells || 0);
   const avgTxSize5m = tx5mTotal > 0 ? dexData.volume.m5 / tx5mTotal : 0;
+
   const possibleWashTrading =
     (dexData.volume.m5 > 5000 && tx5mTotal <= 3) ||
-    (poolAgeHours !== null && poolAgeHours < 2 && dexData.volume.m5 > 20000 && tx5mTotal < 10) ||
-    (avgTxSize5m > 0 && avgTxSize5m > dexData.liquidityUsd * 0.25);
+    (avgTxSize5m > 0 && avgTxSize5m > dexData.liquidityUsd * 0.15) ||
+    (dexData.volume.h1 > dexData.liquidityUsd * 2 && tx1hTotal < 20);
 
-  // 4. Momentum Score with Wash-Trading Dampening (0 - 100)
+  // 5. Momentum Score (0 - 100)
   const buys1h = dexData.txns.h1.buys;
   const sells1h = dexData.txns.h1.sells;
-  const totalTx1h = buys1h + sells1h;
-  const buyRatio1h = totalTx1h > 0 ? buys1h / Math.max(1, sells1h) : 1;
+  const buyRatio1h = tx1hTotal > 0 ? buys1h / Math.max(1, sells1h) : 1;
 
   const vol5mExpected = dexData.volume.h1 / 12;
   const volumeSpikeMultiplier = vol5mExpected > 0 ? dexData.volume.m5 / vol5mExpected : 1;
@@ -69,32 +76,30 @@ export function computeAlphaSignal(
 
   if (volumeSpikeMultiplier > 2.0) rawMomentum += 10;
 
-  // Dampen momentum if wash trading or ultra-fresh pool is detected
-  if (possibleWashTrading) {
-    rawMomentum = Math.min(rawMomentum, 35); // Veto false momentum from wash-trading
-  } else if (poolAgeHours !== null && poolAgeHours < 6) {
-    rawMomentum = Math.min(rawMomentum, 60); // Cap fresh pool momentum
-  }
-  const momentumScore = Math.max(0, Math.min(100, Math.round(rawMomentum)));
+  // Apply pool age dampening
+  rawMomentum = rawMomentum * poolAgeDiscountApplied;
 
-  // 5. AlphaScore: NULL if audit failed; otherwise weighted sum
+  // HARD ZERO on wash trading: zero points awarded to momentum
+  let momentumScore = Math.max(0, Math.min(100, Math.round(rawMomentum)));
+  if (possibleWashTrading) {
+    momentumScore = 0; // 0 points awarded, eliminates the 12pt loophole
+  }
+
+  // 6. AlphaScore: NULL if audit failed, 0 if honeypot or owner balance modification
   let alphaScore: number | null = null;
   if (isAuditVerified && securityScore !== null) {
-    if (security.isHoneypot === true) {
-      alphaScore = 0;
+    if (security.isHoneypot === true || security.ownerCanChangeBalance === true) {
+      alphaScore = 0; // Hard ZERO
     } else {
       alphaScore = Math.round((securityScore * 0.40) + (momentumScore * 0.35) + (liquidityScore * 0.25));
-      if (security.ownerCanChangeBalance === true) {
-        alphaScore = Math.min(alphaScore, 10);
-      }
     }
   }
 
-  // 6. Risk Level
+  // 7. Risk Level
   let riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' | 'UNKNOWN' = 'LOW';
   if (!isAuditVerified) {
     riskLevel = 'UNKNOWN';
-  } else if (security.isHoneypot || (securityScore !== null && securityScore < 30)) {
+  } else if (security.isHoneypot || security.ownerCanChangeBalance || (securityScore !== null && securityScore < 30)) {
     riskLevel = 'CRITICAL';
   } else if (possibleWashTrading || (securityScore !== null && securityScore < 60) || liquidityScore < 30) {
     riskLevel = 'HIGH';
@@ -102,20 +107,22 @@ export function computeAlphaSignal(
     riskLevel = 'MEDIUM';
   }
 
-  // 7. Decision Prompt
+  // 8. Decision Prompt
   let actionAdvice = '';
   if (!isAuditVerified) {
-    actionAdvice = `AUDIT_UNAVAILABLE. Upstream security provider timed out or failed. alphaScore: null. Payment proof NOT consumed. Aborting pre-swap check.`;
+    actionAdvice = `AUDIT_UNAVAILABLE. Upstream security check failed. alphaScore: null. Reusable credit preserved (proof NOT consumed). Aborting pre-swap check.`;
   } else if (security.isHoneypot) {
     actionAdvice = `REJECT / ABORT. Token confirmed as HONEYPOT. Sell is blocked!`;
+  } else if (security.ownerCanChangeBalance) {
+    actionAdvice = `CRITICAL RISK. Contract owner has balance-modification permissions. alphaScore: 0. Abort transaction.`;
   } else if (possibleWashTrading) {
-    actionAdvice = `SUSPECTED WASH TRADING. High volume spike on low transaction count (${tx5mTotal} tx in 5m). Momentum discounted. Exercise caution.`;
+    actionAdvice = `SUSPECTED WASH TRADING. Momentum zeroed out due to artificial volume or high avg trade size relative to liquidity.`;
   } else if (riskLevel === 'CRITICAL') {
     actionAdvice = `CRITICAL RISK (${security.warnings.join('; ')}). Abort transaction.`;
   } else if (alphaScore !== null && alphaScore > 75 && momentumScore > 70) {
-    actionAdvice = `STRONG MOMENTUM SIGNAL. Verified contract, clean liquidity, buy ratio is ${buyRatio1h.toFixed(1)}x.`;
+    actionAdvice = `STRONG MOMENTUM SIGNAL. Verified contract, pool age ${poolAgeHours}h, buy ratio is ${buyRatio1h.toFixed(1)}x.`;
   } else if (momentumScore < 45) {
-    actionAdvice = `MONITOR / PASS. Contract safe, but selling pressure detected (${buys1h} buys vs ${sells1h} sells in 1h).`;
+    actionAdvice = `MONITOR / PASS. Contract safe, but selling pressure or weak momentum detected (${buys1h} buys vs ${sells1h} sells in 1h).`;
   } else {
     actionAdvice = `NEUTRAL / ACCUMULATING. Stable price action and verified contract. Normal liquidity depth.`;
   }
@@ -136,6 +143,7 @@ export function computeAlphaSignal(
       buyPressureRatio1h: parseFloat(buyRatio1h.toFixed(2)),
       volumeSpike5mVs1hAvg: parseFloat(volumeSpikeMultiplier.toFixed(2)),
       poolAgeHours,
+      poolAgeDiscountApplied,
       possibleWashTrading,
     },
     marketSummary: {
@@ -158,15 +166,16 @@ export function computeAlphaSignal(
     },
     scoringMethodology: {
       weights: {
-        securityWeight: '40%',
-        momentumWeight: '35%',
-        liquidityWeight: '25%',
+        security: 0.40,
+        momentum: 0.35,
+        liquidity: 0.25,
       },
       vetoConditions: [
-        'auditStatus !== VERIFIED -> alphaScore = null (No score issued)',
+        'auditStatus !== VERIFIED -> alphaScore = null',
         'isHoneypot === true -> alphaScore = 0',
-        'possibleWashTrading === true -> momentum capped at 35',
-        'ownerCanChangeBalance === true -> alphaScore capped at 10',
+        'ownerCanChangeBalance === true -> alphaScore = 0',
+        'possibleWashTrading === true -> momentumScore = 0 (No points awarded)',
+        'poolAgeHours < 24 -> momentum discounted linearly by (poolAgeHours / 24)',
       ],
     },
     agentActionableSummary: actionAdvice,

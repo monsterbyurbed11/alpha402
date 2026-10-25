@@ -38,10 +38,10 @@ export interface DexPairData {
 export interface SecurityReport {
   auditStatus: 'VERIFIED' | 'UNAVAILABLE' | 'TIMEOUT' | 'ERROR';
   isHoneypot: boolean | null;
-  buyTax: number; // Numeric percentage (e.g. 5.0 for 5%)
-  sellTax: number; // Numeric percentage (e.g. 5.0 for 5%)
-  buyTaxBps: number; // Basis points (e.g. 500 for 5%)
-  sellTaxBps: number; // Basis points (e.g. 500 for 5%)
+  buyTax: number; // Numeric percentage e.g. 5.0 for 5%
+  sellTax: number; // Numeric percentage e.g. 5.0 for 5%
+  buyTaxBps: number; // Basis points e.g. 500 for 5%
+  sellTaxBps: number; // Basis points e.g. 500 for 5%
   isOpenSource: boolean;
   cannotSellAll: boolean;
   ownerCanChangeBalance: boolean;
@@ -60,7 +60,7 @@ export interface TokenAlphaSignal {
     address: string;
     network: string;
   };
-  alphaScore: number | null; // NULL if audit fails/unavailable. Never give numbers for unverified tokens!
+  alphaScore: number | null; // NULL if audit is unverified/failed, 0 if honeypot or owner balance mod
   riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' | 'UNKNOWN';
   signals: {
     momentumScore: number;
@@ -69,6 +69,7 @@ export interface TokenAlphaSignal {
     buyPressureRatio1h: number;
     volumeSpike5mVs1hAvg: number;
     poolAgeHours: number | null;
+    poolAgeDiscountApplied: number; // Float between 0.1 and 1.0 based on pool age
     possibleWashTrading: boolean;
   };
   marketSummary: {
@@ -91,9 +92,9 @@ export interface TokenAlphaSignal {
   };
   scoringMethodology: {
     weights: {
-      securityWeight: '40%';
-      momentumWeight: '35%';
-      liquidityWeight: '25%';
+      security: number; // e.g. 0.40
+      momentum: number; // e.g. 0.35
+      liquidity: number; // e.g. 0.25
     };
     vetoConditions: string[];
   };

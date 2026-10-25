@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { paywall402 } from './middleware/paywall402.js';
+import { paywall402, releaseNonce } from './middleware/paywall402.js';
 import { fetchDexData } from './services/dexscreener.js';
 import { fetchSecurityReport } from './services/goplus.js';
 import { fetchPolymarketAlpha } from './services/polymarket.js';
@@ -16,8 +16,8 @@ app.use('*', cors());
 app.get('/', (c) => {
   return c.json({
     name: 'Alpha402 - Agent On-Chain Alpha API',
-    version: '1.2.0',
-    description: 'Fail-closed, anti-honeypot, wash-trading filtered on-chain alpha signals for autonomous AI agents.',
+    version: '1.3.0',
+    description: 'Fail-closed, anti-honeypot, wash-trading filtered on-chain alpha signals with atomic nonce rollback for AI agents.',
     paymentProtocol: 'HTTP 402 (L402 / x402)',
     endpoints: {
       mcp: '/mcp',
@@ -28,8 +28,9 @@ app.get('/', (c) => {
     },
     scoringFormula: {
       formula: 'AlphaScore = (Security * 0.40) + (Momentum * 0.35) + (Liquidity * 0.25)',
-      failSafe: 'Fail-closed: If audit fails/times out, alphaScore is NULL, isHoneypot is NULL, and payment proof is NOT consumed.',
-      washTradingFilter: 'Momentum is capped at 35 if 5m trade-size/count indicates wash trading or artificial volume.',
+      failSafe: 'Fail-closed: If audit fails/times out, alphaScore is NULL, isHoneypot is NULL, and nonce is DEL released (reusable credit).',
+      washTradingFilter: 'Momentum is zeroed (0 pts) if wash trading is flagged; pools < 24h old get momentum discounted by poolAgeHours/24.',
+      ownerPermissions: 'ownerCanChangeBalance === true hard-zeros alphaScore to 0.',
     },
     status: 'online',
   });
@@ -42,7 +43,7 @@ app.get('/.well-known/agent.json', (c) => {
     name_for_model: 'alpha402_onchain_intelligence',
     name_for_human: 'Alpha402 On-Chain Alpha',
     description_for_model:
-      'Provides fail-closed token momentum, liquidity depth, anti-honeypot contract security audits (weighted 40% security, 35% momentum, 25% liquidity, wash-trade dampened), and Polymarket spreads for autonomous trading agents. Returns alphaScore: null and zero charge on audit failures. Costs $0.02 USDC or 20 sats per request via HTTP 402.',
+      'Provides fail-closed token momentum, liquidity depth, anti-honeypot contract security audits (weighted 40% security, 35% momentum, 25% liquidity, pool-age dampened), and Polymarket spreads for autonomous trading agents. Returns alphaScore: null and releases payment proof as reusable credit on audit failures. Costs $0.02 USDC or 20 sats per request via HTTP 402.',
     auth: {
       type: 'http_402',
       protocols: ['L402', 'x402'],
@@ -50,7 +51,7 @@ app.get('/.well-known/agent.json', (c) => {
     tools: [
       {
         name: 'getTokenAlpha',
-        description: 'Analyzes contract security (fails closed on audit errors with null score), volume spikes, and liquidity for any token.',
+        description: 'Analyzes contract security (fails closed on audit errors with null score and nonce release), volume spikes, and liquidity for any token.',
         parameters: {
           type: 'object',
           properties: {
@@ -105,7 +106,7 @@ app.get('/mcp', (c) => {
   return c.json({
     status: 'ready',
     service: 'alpha402-mcp-server',
-    version: '1.2.0',
+    version: '1.3.0',
     capabilities: { tools: true },
     tools: MCP_TOOLS,
   });
@@ -125,7 +126,7 @@ app.post('/mcp', async (c) => {
           capabilities: { tools: {} },
           serverInfo: {
             name: 'alpha402-intelligence-mcp',
-            version: '1.2.0',
+            version: '1.3.0',
           },
         },
       });
@@ -211,16 +212,16 @@ app.get('/openapi.json', (c) => {
     openapi: '3.1.0',
     info: {
       title: 'Alpha402 Intelligence API',
-      version: '1.2.0',
+      version: '1.3.0',
       description:
-        'HTTP 402 micro-payment on-chain alpha and security engine. Uses fail-closed audit verification (null score + zero charge on audit fail) and wash-trading dampened momentum.',
+        'HTTP 402 micro-payment on-chain alpha and security engine. Features atomic nonce rollback on audit failures (reusable credit) and pool-age dampened momentum.',
     },
     paths: {
       '/v1/token-alpha': {
         get: {
           summary: 'Get Token Alpha & Security Audit',
           description:
-            'Fetches live price, liquidity depth, 5m/1h volume momentum, and contract safety audit. Fails closed if audit is unavailable (alphaScore: null, charged: false).',
+            'Fetches live price, liquidity depth, 5m/1h volume momentum, and contract safety audit. Fails closed if audit is unavailable (alphaScore: null, reusableCredit: true).',
           parameters: [
             {
               name: 'address',
@@ -303,6 +304,7 @@ app.get('/openapi.json', (c) => {
           properties: {
             success: { type: 'boolean' },
             charged: { type: 'boolean', description: 'False if audit failed or was unavailable' },
+            reusableCredit: { type: 'boolean', description: 'True if nonce was DEL released and credit is reusable' },
             paymentVerifiedBy: { type: 'string', example: 'x402_Base_USDC' },
             data: {
               type: 'object',
@@ -320,7 +322,7 @@ app.get('/openapi.json', (c) => {
                   type: ['number', 'null'],
                   minimum: 0,
                   maximum: 100,
-                  description: 'Composite alpha score. NULL if upstream audit was unavailable (Fail-closed).',
+                  description: 'Composite alpha score. NULL if upstream audit was unavailable (Fail-closed). 0 if honeypot or balance modification risk.',
                 },
                 riskLevel: { type: 'string', enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL', 'UNKNOWN'] },
                 signals: {
@@ -332,6 +334,7 @@ app.get('/openapi.json', (c) => {
                     buyPressureRatio1h: { type: 'number' },
                     volumeSpike5mVs1hAvg: { type: 'number' },
                     poolAgeHours: { type: ['number', 'null'] },
+                    poolAgeDiscountApplied: { type: 'number', description: 'Multiplier (0.1 to 1.0) applied to momentum based on pool age' },
                     possibleWashTrading: { type: 'boolean', description: 'True if volume spike appears artificial' },
                   },
                 },
@@ -365,9 +368,9 @@ app.get('/openapi.json', (c) => {
                     weights: {
                       type: 'object',
                       properties: {
-                        securityWeight: { type: 'string', example: '40%' },
-                        momentumWeight: { type: 'string', example: '35%' },
-                        liquidityWeight: { type: 'string', example: '25%' },
+                        security: { type: 'number', example: 0.40 },
+                        momentum: { type: 'number', example: 0.35 },
+                        liquidity: { type: 'number', example: 0.25 },
                       },
                     },
                     vetoConditions: { type: 'array', items: { type: 'string' } },
@@ -461,10 +464,13 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
   ]);
 
   if (!dexData) {
+    // Release the nonce since we couldn't fulfill the core market lookup
+    await releaseNonce(c);
     return c.json(
       {
         error: `No active liquidity pools found for address ${address} on network ${network}.`,
-        suggestion: 'Verify the token contract address or try another network.',
+        reusableCredit: true,
+        suggestion: 'Verify the token contract address. Your payment proof remains valid and reusable.',
       },
       404
     );
@@ -474,11 +480,18 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
   c.header('X-Alpha402-Audit-Status', securityReport.auditStatus);
 
   const isAuditVerified = securityReport.auditStatus === 'VERIFIED';
+
+  // If the upstream security audit failed, release the nonce key so the proof is a reusable credit
+  if (!isAuditVerified) {
+    await releaseNonce(c);
+  }
+
   const alphaResult = computeAlphaSignal(network, dexData, securityReport);
 
   return c.json({
     success: true,
-    charged: isAuditVerified, // False if audit failed: Proof is not consumed
+    charged: isAuditVerified,
+    reusableCredit: !isAuditVerified, // Nonce was DEL released on failure
     paymentVerifiedBy: c.get('paymentType'),
     data: alphaResult,
   });
