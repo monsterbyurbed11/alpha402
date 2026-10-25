@@ -16,8 +16,8 @@ app.use('*', cors());
 app.get('/', (c) => {
   return c.json({
     name: 'Alpha402 - Agent On-Chain Alpha API',
-    version: '1.1.0',
-    description: 'Fail-closed, anti-honeypot, on-chain alpha and prediction market signals for autonomous AI agents.',
+    version: '1.2.0',
+    description: 'Fail-closed, anti-honeypot, wash-trading filtered on-chain alpha signals for autonomous AI agents.',
     paymentProtocol: 'HTTP 402 (L402 / x402)',
     endpoints: {
       mcp: '/mcp',
@@ -28,7 +28,8 @@ app.get('/', (c) => {
     },
     scoringFormula: {
       formula: 'AlphaScore = (Security * 0.40) + (Momentum * 0.35) + (Liquidity * 0.25)',
-      failSafe: 'Fail-closed: If audit times out or is unindexed, isHoneypot is null and AlphaScore is vetoed.',
+      failSafe: 'Fail-closed: If audit fails/times out, alphaScore is NULL, isHoneypot is NULL, and payment proof is NOT consumed.',
+      washTradingFilter: 'Momentum is capped at 35 if 5m trade-size/count indicates wash trading or artificial volume.',
     },
     status: 'online',
   });
@@ -41,7 +42,7 @@ app.get('/.well-known/agent.json', (c) => {
     name_for_model: 'alpha402_onchain_intelligence',
     name_for_human: 'Alpha402 On-Chain Alpha',
     description_for_model:
-      'Provides fail-closed token momentum, liquidity depth, anti-honeypot contract security audits (weighted 40% security, 35% momentum, 25% liquidity), and Polymarket spreads for autonomous trading agents. Costs $0.02 USDC or 20 sats per request via HTTP 402.',
+      'Provides fail-closed token momentum, liquidity depth, anti-honeypot contract security audits (weighted 40% security, 35% momentum, 25% liquidity, wash-trade dampened), and Polymarket spreads for autonomous trading agents. Returns alphaScore: null and zero charge on audit failures. Costs $0.02 USDC or 20 sats per request via HTTP 402.',
     auth: {
       type: 'http_402',
       protocols: ['L402', 'x402'],
@@ -49,7 +50,7 @@ app.get('/.well-known/agent.json', (c) => {
     tools: [
       {
         name: 'getTokenAlpha',
-        description: 'Analyzes contract security (fails closed on audit errors), volume spikes, and liquidity for any token.',
+        description: 'Analyzes contract security (fails closed on audit errors with null score), volume spikes, and liquidity for any token.',
         parameters: {
           type: 'object',
           properties: {
@@ -104,7 +105,7 @@ app.get('/mcp', (c) => {
   return c.json({
     status: 'ready',
     service: 'alpha402-mcp-server',
-    version: '1.1.0',
+    version: '1.2.0',
     capabilities: { tools: true },
     tools: MCP_TOOLS,
   });
@@ -124,7 +125,7 @@ app.post('/mcp', async (c) => {
           capabilities: { tools: {} },
           serverInfo: {
             name: 'alpha402-intelligence-mcp',
-            version: '1.1.0',
+            version: '1.2.0',
           },
         },
       });
@@ -210,16 +211,16 @@ app.get('/openapi.json', (c) => {
     openapi: '3.1.0',
     info: {
       title: 'Alpha402 Intelligence API',
-      version: '1.1.0',
+      version: '1.2.0',
       description:
-        'HTTP 402 micro-payment on-chain alpha and security engine. Uses fail-closed audit verification and transparent weighting (40% security, 35% momentum, 25% liquidity).',
+        'HTTP 402 micro-payment on-chain alpha and security engine. Uses fail-closed audit verification (null score + zero charge on audit fail) and wash-trading dampened momentum.',
     },
     paths: {
       '/v1/token-alpha': {
         get: {
           summary: 'Get Token Alpha & Security Audit',
           description:
-            'Fetches live price, liquidity depth, 5m/1h volume momentum, and contract safety audit. Fails closed if audit is unavailable.',
+            'Fetches live price, liquidity depth, 5m/1h volume momentum, and contract safety audit. Fails closed if audit is unavailable (alphaScore: null, charged: false).',
           parameters: [
             {
               name: 'address',
@@ -281,7 +282,16 @@ app.get('/openapi.json', (c) => {
                 },
               },
             },
-            '402': { description: 'Payment required via L402 or x402' },
+            '402': {
+              description: 'Payment required via L402 or x402',
+              content: {
+                'application/json': {
+                  schema: {
+                    $ref: '#/components/schemas/PaymentRequiredResponse',
+                  },
+                },
+              },
+            },
           },
         },
       },
@@ -292,6 +302,7 @@ app.get('/openapi.json', (c) => {
           type: 'object',
           properties: {
             success: { type: 'boolean' },
+            charged: { type: 'boolean', description: 'False if audit failed or was unavailable' },
             paymentVerifiedBy: { type: 'string', example: 'x402_Base_USDC' },
             data: {
               type: 'object',
@@ -305,16 +316,23 @@ app.get('/openapi.json', (c) => {
                     network: { type: 'string' },
                   },
                 },
-                alphaScore: { type: 'number', minimum: 0, maximum: 100, description: 'Composite alpha score (40% security, 35% momentum, 25% liquidity)' },
-                riskLevel: { type: 'string', enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] },
+                alphaScore: {
+                  type: ['number', 'null'],
+                  minimum: 0,
+                  maximum: 100,
+                  description: 'Composite alpha score. NULL if upstream audit was unavailable (Fail-closed).',
+                },
+                riskLevel: { type: 'string', enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL', 'UNKNOWN'] },
                 signals: {
                   type: 'object',
                   properties: {
                     momentumScore: { type: 'number' },
-                    securityScore: { type: 'number' },
+                    securityScore: { type: ['number', 'null'] },
                     liquidityScore: { type: 'number' },
                     buyPressureRatio1h: { type: 'number' },
                     volumeSpike5mVs1hAvg: { type: 'number' },
+                    poolAgeHours: { type: ['number', 'null'] },
+                    possibleWashTrading: { type: 'boolean', description: 'True if volume spike appears artificial' },
                   },
                 },
                 marketSummary: {
@@ -333,8 +351,10 @@ app.get('/openapi.json', (c) => {
                   properties: {
                     auditStatus: { type: 'string', enum: ['VERIFIED', 'UNAVAILABLE', 'TIMEOUT', 'ERROR'] },
                     isHoneypot: { type: ['boolean', 'null'], description: 'Null if audit failed (fail-closed)' },
-                    buyTax: { type: 'string' },
-                    sellTax: { type: 'string' },
+                    buyTax: { type: 'number', description: 'Numeric percentage, e.g. 5.0 for 5%' },
+                    sellTax: { type: 'number', description: 'Numeric percentage, e.g. 5.0 for 5%' },
+                    buyTaxBps: { type: 'number', description: 'Basis points, e.g. 500 for 5%' },
+                    sellTaxBps: { type: 'number', description: 'Basis points, e.g. 500 for 5%' },
                     isOpenSource: { type: 'boolean' },
                     warnings: { type: 'array', items: { type: 'string' } },
                   },
@@ -374,8 +394,25 @@ app.get('/openapi.json', (c) => {
             paymentOptions: {
               type: 'object',
               properties: {
-                l402: { type: 'object' },
-                x402: { type: 'object' },
+                l402: {
+                  type: 'object',
+                  properties: {
+                    protocol: { type: 'string', example: 'Lightning Network' },
+                    token: { type: 'string' },
+                    invoice: { type: 'string' },
+                    settleFormat: { type: 'string' },
+                  },
+                },
+                x402: {
+                  type: 'object',
+                  properties: {
+                    protocol: { type: 'string', example: 'EVM / Base USDC' },
+                    network: { type: 'string', example: 'base' },
+                    amountUsdc: { type: 'number', example: 0.02 },
+                    recipient: { type: 'string' },
+                    settleFormat: { type: 'string' },
+                  },
+                },
               },
             },
           },
@@ -392,8 +429,12 @@ app.get('/openapi.json', (c) => {
                 properties: {
                   id: { type: 'string' },
                   question: { type: 'string' },
-                  spread: { type: 'number' },
+                  category: { type: 'string' },
                   volumeUsd: { type: 'number' },
+                  liquidityUsd: { type: 'number' },
+                  spread: { type: 'number' },
+                  resolutionDate: { type: 'string' },
+                  url: { type: 'string' },
                 },
               },
             },
@@ -432,9 +473,12 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
   // Set audit status header so trading agents can inspect header directly
   c.header('X-Alpha402-Audit-Status', securityReport.auditStatus);
 
+  const isAuditVerified = securityReport.auditStatus === 'VERIFIED';
   const alphaResult = computeAlphaSignal(network, dexData, securityReport);
+
   return c.json({
     success: true,
+    charged: isAuditVerified, // False if audit failed: Proof is not consumed
     paymentVerifiedBy: c.get('paymentType'),
     data: alphaResult,
   });

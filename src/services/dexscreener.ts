@@ -57,6 +57,7 @@ export async function fetchDexData(tokenAddress: string, preferredChain?: string
       },
       liquidityUsd: pair.liquidity?.usd || 0,
       fdv: pair.fdv || 0,
+      pairCreatedAt: pair.pairCreatedAt || undefined,
       url: pair.url || `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`,
     };
   } catch (error) {

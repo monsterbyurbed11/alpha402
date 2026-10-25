@@ -37,7 +37,7 @@ export async function fetchSecurityReport(network: Network, tokenAddress: string
     clearTimeout(timeout);
 
     if (!res.ok) {
-      warnings.push(`AUDIT_UNAVAILABLE: Security provider responded with HTTP ${res.status}. Failing closed.`);
+      warnings.push(`AUDIT_UNAVAILABLE: Security provider HTTP ${res.status}. Failing closed.`);
       return createFailClosedReport('UNAVAILABLE', warnings);
     }
 
@@ -56,15 +56,20 @@ export async function fetchSecurityReport(network: Network, tokenAddress: string
       riskCount += 10;
     }
 
-    const buyTax = parseFloat(details.buy_tax || '0') * 100;
-    const sellTax = parseFloat(details.sell_tax || '0') * 100;
+    // Explicit numeric percentages and basis points
+    const rawBuyTax = parseFloat(details.buy_tax || '0');
+    const rawSellTax = parseFloat(details.sell_tax || '0');
+    const buyTax = parseFloat((rawBuyTax * 100).toFixed(2));
+    const sellTax = parseFloat((rawSellTax * 100).toFixed(2));
+    const buyTaxBps = Math.round(rawBuyTax * 10000);
+    const sellTaxBps = Math.round(rawSellTax * 10000);
 
     if (buyTax > 10) {
-      warnings.push(`High Buy Tax detected: ${buyTax.toFixed(1)}%`);
+      warnings.push(`High Buy Tax detected: ${buyTax}%`);
       riskCount += 2;
     }
     if (sellTax > 10) {
-      warnings.push(`High Sell Tax detected: ${sellTax.toFixed(1)}%`);
+      warnings.push(`High Sell Tax detected: ${sellTax}%`);
       riskCount += 3;
     }
 
@@ -113,6 +118,8 @@ export async function fetchSecurityReport(network: Network, tokenAddress: string
       isHoneypot,
       buyTax,
       sellTax,
+      buyTaxBps,
+      sellTaxBps,
       isOpenSource,
       cannotSellAll,
       ownerCanChangeBalance,
@@ -140,6 +147,8 @@ function createFailClosedReport(status: 'UNAVAILABLE' | 'TIMEOUT' | 'ERROR', war
     isHoneypot: null, // Explicitly NULL (Unknown), NEVER false
     buyTax: 0,
     sellTax: 0,
+    buyTaxBps: 0,
+    sellTaxBps: 0,
     isOpenSource: false,
     cannotSellAll: false,
     ownerCanChangeBalance: false,
@@ -147,7 +156,7 @@ function createFailClosedReport(status: 'UNAVAILABLE' | 'TIMEOUT' | 'ERROR', war
     isBlacklisted: false,
     creatorPercent: 0,
     topHoldersPercent: 0,
-    riskCount: 8, // Substantial risk penalty for unverified contracts
+    riskCount: 8,
     warnings,
   };
 }

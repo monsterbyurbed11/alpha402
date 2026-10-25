@@ -1,77 +1,92 @@
 import { Context, Next } from 'hono';
 
 export interface PaywallConfig {
-  costUsdc: number; // e.g. 0.02 ($0.02)
-  costSats: number; // e.g. 20 sats
+  costUsdc: number;
+  costSats: number;
   baseRecipientAddress: string;
-  enableSandbox: boolean; // allows 'TEST_PREIMAGE' or '?demo=true' for local testing
-  maxDemoQueries?: number; // default: 3 free queries before requiring 402 payment
+  enableSandbox: boolean;
+  upstashUrl?: string;
+  upstashToken?: string;
 }
 
 export const DEFAULT_CONFIG: PaywallConfig = {
   costUsdc: 0.02,
   costSats: 20,
-  baseRecipientAddress: '0x8a8c238ed2b46908Ff6C6922a3870984f20f8913', // replace with creator's wallet
+  baseRecipientAddress: '0x8a8c238ed2b46908Ff6C6922a3870984f20f8913',
   enableSandbox: true,
-  maxDemoQueries: 3,
 };
 
-// In-memory nonce store (for Cloudflare Workers, can be backed by Upstash or KV)
-const spentTokens = new Set<string>();
+// Fallback in-memory set for local offline dev
+const localSpentTokens = new Set<string>();
 
-// Track free demo trial queries per client identifier (IP or test session)
-const demoUsageMap = new Map<string, number>();
+/**
+ * Atomic Distributed Nonce Settlement via Upstash Redis REST API
+ * Guarantees cross-region, cross-isolate single-spend execution using atomic SET ... EX ... NX.
+ */
+async function atomicClaimNonce(
+  nonceKey: string,
+  ttlSeconds: number,
+  env: Record<string, any>
+): Promise<boolean> {
+  const upstashUrl = env.UPSTASH_REDIS_REST_URL;
+  const upstashToken = env.UPSTASH_REDIS_REST_TOKEN;
+
+  if (upstashUrl && upstashToken) {
+    try {
+      // Redis command: SET alpha402:nonce:<key> 1 EX <ttl> NX
+      const endpoint = `${upstashUrl}/set/alpha402:nonce:${nonceKey}/1?EX=${ttlSeconds}&NX`;
+      const res = await fetch(endpoint, {
+        headers: {
+          Authorization: `Bearer ${upstashToken}`,
+        },
+      });
+
+      if (res.ok) {
+        const data: any = await res.json();
+        // If atomic NX succeeded, Redis returns {"result": "OK"}.
+        // If already claimed by another concurrent request, Redis returns {"result": null}.
+        return data.result === 'OK';
+      }
+    } catch (e) {
+      console.error('Upstash atomic nonce check error:', e);
+    }
+  }
+
+  // Fallback for local development without Upstash configured
+  if (localSpentTokens.has(nonceKey)) {
+    return false;
+  }
+  localSpentTokens.add(nonceKey);
+  return true;
+}
 
 export function paywall402(config: Partial<PaywallConfig> = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
-  const maxDemo = cfg.maxDemoQueries ?? 3;
 
   return async function (c: Context, next: Next) {
-    // Determine client identifier for demo quota tracking
-    const clientIp =
-      c.req.header('cf-connecting-ip') ||
-      c.req.header('x-real-ip') ||
-      c.req.header('x-forwarded-for')?.split(',')[0].trim() ||
-      'sandbox_tester';
-
-    // 1. Check for free bypass / demo testing (limited to maxDemo queries)
+    // 1. Check for free bypass / demo testing
     const isDemo = c.req.query('demo') === 'true';
     if (cfg.enableSandbox && isDemo) {
-      const currentUsage = demoUsageMap.get(clientIp) || 0;
-
-      if (currentUsage < maxDemo) {
-        demoUsageMap.set(clientIp, currentUsage + 1);
-        const remaining = maxDemo - (currentUsage + 1);
-        
-        c.header('X-Demo-Trial', 'active');
-        c.header('X-Demo-Used', (currentUsage + 1).toString());
-        c.header('X-Demo-Remaining', remaining.toString());
-        c.set('paymentType', `demo_sandbox_trial_${currentUsage + 1}_of_${maxDemo}`);
-        
-        return await next();
-      }
-
-      // If demo limit reached, proceed to 402 challenge below with an explicit note
+      c.set('paymentType', 'demo_sandbox');
+      return await next();
     }
 
     const authHeader = c.req.header('Authorization');
 
     // 2. Validate Payment if Authorization header is present
     if (authHeader) {
+      let paymentProof = '';
+      let paymentType = '';
+      let ttlSeconds = 86400; // Default 24h past authorization window
+
       // Check L402 format: "L402 <macaroon>:<preimage>"
       if (authHeader.startsWith('L402 ')) {
         const credentials = authHeader.slice(5).trim();
         const [token, preimage] = credentials.split(':');
-
         if (token && preimage) {
-          // Sandbox or valid preimage verification
           if (cfg.enableSandbox && (preimage.startsWith('TEST_') || preimage.length === 64)) {
-            if (spentTokens.has(token)) {
-              return c.json({ error: 'Token already redeemed (replay attack prevented)' }, 402);
-            }
-            spentTokens.add(token);
-            c.set('paymentType', 'L402_Lightning');
-            return await next();
+            paymentProof = token;
+            paymentType = 'L402_Lightning';
           }
         }
       }
@@ -80,22 +95,43 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
       if (authHeader.startsWith('x402 ')) {
         const proof = authHeader.slice(5).trim();
         if (proof && proof.length >= 10) {
-          if (spentTokens.has(proof)) {
-            return c.json({ error: 'Payment proof already spent' }, 402);
-          }
-          spentTokens.add(proof);
-          c.set('paymentType', 'x402_Base_USDC');
-          return await next();
+          paymentProof = proof;
+          paymentType = 'x402_Base_USDC';
+          ttlSeconds = 86400 * 3; // 3-day window for on-chain tx receipts
         }
       }
 
-      // Check Bearer token (for traditional agent API keys or test keys)
+      // Check Bearer token
       if (authHeader.startsWith('Bearer ')) {
         const apiKey = authHeader.slice(7).trim();
         if (apiKey.startsWith('agent_') || (cfg.enableSandbox && apiKey === 'test_key')) {
-          c.set('paymentType', 'ApiKey');
-          return await next();
+          paymentProof = apiKey;
+          paymentType = 'ApiKey';
+          ttlSeconds = 60;
         }
+      }
+
+      if (paymentProof) {
+        // Atomic Check & Set before serving response
+        const env = c.env || {};
+        const isFreshClaim = await atomicClaimNonce(paymentProof, ttlSeconds, env);
+
+        if (!isFreshClaim) {
+          return c.json(
+            {
+              error: 'Payment Required - Proof already redeemed',
+              statusCode: 402,
+              reason: 'Replay protection: This payment proof or transaction hash has already been consumed.',
+            },
+            402
+          );
+        }
+
+        c.set('paymentType', paymentType);
+        c.set('paymentProof', paymentProof);
+
+        await next();
+        return;
       }
     }
 
@@ -108,16 +144,11 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
     c.header('X-402-Cost-Sats', cfg.costSats.toString());
     c.header('X-402-Payment-Recipient', cfg.baseRecipientAddress);
 
-    const currentUsage = demoUsageMap.get(clientIp) || 0;
-    const isQuotaExceeded = isDemo && currentUsage >= maxDemo;
-
     return c.json(
       {
-        error: isQuotaExceeded ? 'Free Demo Limit Reached' : 'Payment Required',
+        error: 'Payment Required',
         statusCode: 402,
-        message: isQuotaExceeded
-          ? `You have used all ${maxDemo} free trial queries for your client. Please authenticate with your AI Agent wallet via L402 or x402 to continue.`
-          : 'This API requires micro-payment from your AI Agent wallet.',
+        message: 'This API requires micro-payment from your AI Agent wallet.',
         pricing: {
           costUsdc: cfg.costUsdc,
           costSats: cfg.costSats,
@@ -139,13 +170,7 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
         },
         sandboxTesting: cfg.enableSandbox
           ? {
-              demoLimit: maxDemo,
-              demoUsed: currentUsage,
-              demoRemaining: Math.max(0, maxDemo - currentUsage),
-              instructions:
-                currentUsage < maxDemo
-                  ? `Add '?demo=true' to your request for ${maxDemo - currentUsage} more free trial queries.`
-                  : 'Free demo trial exhausted. Fund your agent wallet with Base USDC or Lightning sats.',
+              note: 'Testing mode enabled. Add header "Authorization: L402 test_token:TEST_PREIMAGE_OK" or query param "?demo=true" to test without crypto.',
             }
           : undefined,
       },

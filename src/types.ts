@@ -31,14 +31,17 @@ export interface DexPairData {
   };
   liquidityUsd: number;
   fdv: number;
+  pairCreatedAt?: number; // Epoch timestamp in ms
   url: string;
 }
 
 export interface SecurityReport {
   auditStatus: 'VERIFIED' | 'UNAVAILABLE' | 'TIMEOUT' | 'ERROR';
   isHoneypot: boolean | null;
-  buyTax: number;
-  sellTax: number;
+  buyTax: number; // Numeric percentage (e.g. 5.0 for 5%)
+  sellTax: number; // Numeric percentage (e.g. 5.0 for 5%)
+  buyTaxBps: number; // Basis points (e.g. 500 for 5%)
+  sellTaxBps: number; // Basis points (e.g. 500 for 5%)
   isOpenSource: boolean;
   cannotSellAll: boolean;
   ownerCanChangeBalance: boolean;
@@ -57,14 +60,16 @@ export interface TokenAlphaSignal {
     address: string;
     network: string;
   };
-  alphaScore: number; // 0 - 100
-  riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  alphaScore: number | null; // NULL if audit fails/unavailable. Never give numbers for unverified tokens!
+  riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' | 'UNKNOWN';
   signals: {
-    momentumScore: number; // 0 - 100
-    securityScore: number; // 0 - 100
-    liquidityScore: number; // 0 - 100
-    buyPressureRatio1h: number; // e.g. 1.8 (1.8x more buys than sells)
-    volumeSpike5mVs1hAvg: number; // multiplier
+    momentumScore: number;
+    securityScore: number | null;
+    liquidityScore: number;
+    buyPressureRatio1h: number;
+    volumeSpike5mVs1hAvg: number;
+    poolAgeHours: number | null;
+    possibleWashTrading: boolean;
   };
   marketSummary: {
     priceUsd: number;
@@ -77,8 +82,10 @@ export interface TokenAlphaSignal {
   securityAudit: {
     auditStatus: 'VERIFIED' | 'UNAVAILABLE' | 'TIMEOUT' | 'ERROR';
     isHoneypot: boolean | null;
-    buyTax: string;
-    sellTax: string;
+    buyTax: number;
+    sellTax: number;
+    buyTaxBps: number;
+    sellTaxBps: number;
     isOpenSource: boolean;
     warnings: string[];
   };
@@ -90,7 +97,7 @@ export interface TokenAlphaSignal {
     };
     vetoConditions: string[];
   };
-  agentActionableSummary: string; // Tailored for LLM trading decisions
+  agentActionableSummary: string;
   timestamp: string;
 }
 
@@ -104,13 +111,4 @@ export interface PolymarketOpportunity {
   spread: number;
   resolutionDate: string;
   url: string;
-}
-
-export interface PaymentDetails {
-  protocol: 'L402' | 'x402';
-  costUsdc: number;
-  costSats: number;
-  invoice?: string;
-  token?: string;
-  recipientAddress?: string;
 }
