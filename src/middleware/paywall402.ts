@@ -10,7 +10,7 @@ export interface PaywallConfig {
 export const DEFAULT_CONFIG: PaywallConfig = {
   costUsdc: 0.02,
   costSats: 20,
-  baseRecipientAddress: '0x000000000000000000000000000000000000dEaD', // replace with creator's wallet
+  baseRecipientAddress: '0x8a8c238ed2b46908Ff6C6922a3870984f20f8913', // replace with creator's wallet
   enableSandbox: true,
 };
 
