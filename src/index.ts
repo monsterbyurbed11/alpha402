@@ -20,6 +20,7 @@ app.get('/', (c) => {
     description: 'High-speed, anti-honeypot, on-chain alpha and prediction market signals for autonomous AI agents.',
     paymentProtocol: 'HTTP 402 (L402 / x402)',
     endpoints: {
+      mcp: '/mcp',
       tokenAlpha: '/v1/token-alpha?network=base&address=0x...',
       polymarketAlpha: '/v1/polymarket-alpha',
       manifest: '/.well-known/agent.json',
@@ -63,7 +64,143 @@ app.get('/.well-known/agent.json', (c) => {
   });
 });
 
-// 3. OpenAPI 3.1 Spec for LangChain, AutoGen & Cursor (Free)
+// 3. HTTP MCP Endpoint for Smithery, Cursor & Claude (Streamable & JSON-RPC)
+const MCP_TOOLS = [
+  {
+    name: 'get_token_alpha',
+    description:
+      'Performs real-time security audit (is_honeypot, sell taxes, balance modifications), volume momentum analysis, and liquidity depth scoring for any token. Supports Base, Solana, Ethereum, BSC, Arbitrum.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        network: {
+          type: 'string',
+          enum: ['base', 'solana', 'ethereum', 'bsc', 'arbitrum', 'polygon'],
+          description: 'Blockchain network (default is base)',
+        },
+        address: {
+          type: 'string',
+          description: 'The smart contract address or token mint address',
+        },
+      },
+      required: ['address'],
+    },
+  },
+  {
+    name: 'get_polymarket_alpha',
+    description: 'Retrieves top volume prediction markets, outcomes, prices, and arbitrage spreads from Polymarket.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+];
+
+app.get('/mcp', (c) => {
+  return c.json({
+    status: 'ready',
+    service: 'alpha402-mcp-server',
+    version: '1.0.0',
+    capabilities: { tools: true },
+    tools: MCP_TOOLS,
+  });
+});
+
+app.post('/mcp', async (c) => {
+  try {
+    const body: any = await c.req.json();
+    const { id, method, params } = body;
+
+    if (method === 'initialize') {
+      return c.json({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: {
+            name: 'alpha402-intelligence-mcp',
+            version: '1.0.0',
+          },
+        },
+      });
+    }
+
+    if (method === 'tools/list') {
+      return c.json({
+        jsonrpc: '2.0',
+        id,
+        result: { tools: MCP_TOOLS },
+      });
+    }
+
+    if (method === 'tools/call') {
+      const toolName = params?.name;
+      const args = params?.arguments || {};
+
+      if (toolName === 'get_token_alpha') {
+        const address = args.address;
+        const network = (args.network || 'base').toLowerCase() as Network;
+
+        const [dexData, securityReport] = await Promise.all([
+          fetchDexData(address, network),
+          fetchSecurityReport(network, address),
+        ]);
+
+        if (!dexData) {
+          return c.json({
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: `No active liquidity pools found for ${address} on ${network}.` }],
+              isError: true,
+            },
+          });
+        }
+
+        const alphaSignal = computeAlphaSignal(network, dexData, securityReport);
+        return c.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            content: [{ type: 'text', text: JSON.stringify(alphaSignal, null, 2) }],
+          },
+        });
+      }
+
+      if (toolName === 'get_polymarket_alpha') {
+        const markets = await fetchPolymarketAlpha();
+        return c.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            content: [{ type: 'text', text: JSON.stringify(markets, null, 2) }],
+          },
+        });
+      }
+
+      return c.json({
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32601, message: `Tool not found: ${toolName}` },
+      });
+    }
+
+    return c.json({
+      jsonrpc: '2.0',
+      id: id || null,
+      result: {},
+    });
+  } catch (err: any) {
+    return c.json({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32700, message: `Parse error: ${err.message}` },
+    });
+  }
+});
+
+// 4. OpenAPI 3.1 Spec for LangChain, AutoGen & Cursor (Free)
 app.get('/openapi.json', (c) => {
   return c.json({
     openapi: '3.1.0',
@@ -99,7 +236,7 @@ app.get('/openapi.json', (c) => {
   });
 });
 
-// 4. Token Alpha Analysis (Protected by 402 Paywall)
+// 5. Token Alpha Analysis (Protected by 402 Paywall)
 app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (c) => {
   const address = c.req.query('address');
   const network = (c.req.query('network') || 'base').toLowerCase() as Network;
@@ -132,7 +269,7 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
   });
 });
 
-// 5. Polymarket Alpha Signals (Protected by 402 Paywall)
+// 6. Polymarket Alpha Signals (Protected by 402 Paywall)
 app.get('/v1/polymarket-alpha', paywall402({ costUsdc: 0.01, costSats: 10 }), async (c) => {
   const opportunities = await fetchPolymarketAlpha();
   return c.json({
