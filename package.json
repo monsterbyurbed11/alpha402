@@ -1,0 +1,35 @@
+{
+  "name": "alpha402",
+  "version": "1.0.0",
+  "description": "HTTP 402 Real-Time On-Chain Alpha API for Autonomous AI Agents",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/server-node.ts",
+    "dev": "tsx watch src/server-node.ts",
+    "test-agent": "tsx test-agent.ts",
+    "mcp": "tsx src/mcp/server.ts",
+    "build": "tsc"
+  },
+  "keywords": [
+    "http-402",
+    "l402",
+    "x402",
+    "ai-agents",
+    "crypto",
+    "dex",
+    "alpha",
+    "mcp"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "hono": "^4.13.14"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
