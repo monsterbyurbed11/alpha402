@@ -7,7 +7,11 @@ import { fetchPolymarketAlpha } from './services/polymarket.js';
 import { computeAlphaSignal } from './services/alphaEngine.js';
 import { Network } from './types.js';
 
-const app = new Hono();
+type AppVariables = {
+  paymentType: string;
+};
+
+const app = new Hono<{ Variables: AppVariables }>();
 
 // Enable CORS for web-based agent frontends & MCP web bridges
 app.use('*', cors());
@@ -67,9 +71,29 @@ app.get('/.well-known/agent.json', (c) => {
 // 3. HTTP MCP Endpoint for Smithery, Cursor & Claude (Streamable & JSON-RPC)
 const MCP_TOOLS = [
   {
+    name: 'check_token_security',
+    description:
+      'Fast, low-cost anti-honeypot and security audit (checks honeypot status, buy/sell tax, blacklist, freeze authority, owner balance manipulation). Tier 1: $0.005 micro-tier for high-frequency token screening.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        network: {
+          type: 'string',
+          enum: ['base', 'solana', 'ethereum', 'bsc', 'arbitrum', 'polygon'],
+          description: 'Blockchain network (default is base)',
+        },
+        address: {
+          type: 'string',
+          description: 'The smart contract address or token mint address',
+        },
+      },
+      required: ['address'],
+    },
+  },
+  {
     name: 'get_token_alpha',
     description:
-      'Performs real-time security audit (is_honeypot, sell taxes, balance modifications), volume momentum analysis, and liquidity depth scoring for any token. Supports Base, Solana, Ethereum, BSC, Arbitrum.',
+      'Complete alpha intelligence: security audit + 5m vs 1h volume acceleration, buy/sell pressure ratio, liquidity depth, and LLM trading recommendation score (0-100). Tier 2: $0.02.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -88,7 +112,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'get_polymarket_alpha',
-    description: 'Retrieves top volume prediction markets, outcomes, prices, and arbitrage spreads from Polymarket.',
+    description: 'Retrieves top volume prediction markets, outcomes, prices, and arbitrage spreads from Polymarket. Tier: $0.01.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -137,6 +161,20 @@ app.post('/mcp', async (c) => {
     if (method === 'tools/call') {
       const toolName = params?.name;
       const args = params?.arguments || {};
+
+      if (toolName === 'check_token_security') {
+        const address = args.address;
+        const network = (args.network || 'base').toLowerCase() as Network;
+
+        const securityReport = await fetchSecurityReport(network, address);
+        return c.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            content: [{ type: 'text', text: JSON.stringify(securityReport, null, 2) }],
+          },
+        });
+      }
 
       if (toolName === 'get_token_alpha') {
         const address = args.address;
@@ -210,22 +248,35 @@ app.get('/openapi.json', (c) => {
       description: 'Micro-payment powered on-chain intelligence for autonomous agents.',
     },
     paths: {
+      '/v1/security-check': {
+        get: {
+          summary: 'Fast Anti-Honeypot & Contract Audit (Micro-Tier: $0.005)',
+          parameters: [
+            { name: 'address', in: 'query', required: true, schema: { type: 'string' } },
+            { name: 'network', in: 'query', required: false, schema: { type: 'string', default: 'base' } },
+          ],
+          responses: {
+            '200': { description: 'Honeypot, tax, blacklist and security risk report' },
+            '402': { description: 'Payment required via L402 ($0.005 or 5 sats)' },
+          },
+        },
+      },
       '/v1/token-alpha': {
         get: {
-          summary: 'Get Token Alpha & Security Audit',
+          summary: 'Get Token Alpha & Security Audit (Tier: $0.02)',
           parameters: [
             { name: 'address', in: 'query', required: true, schema: { type: 'string' } },
             { name: 'network', in: 'query', required: false, schema: { type: 'string', default: 'base' } },
           ],
           responses: {
             '200': { description: 'Full token alpha analysis and LLM recommendation' },
-            '402': { description: 'Payment required via L402 or x402' },
+            '402': { description: 'Payment required via L402 ($0.02 or 20 sats)' },
           },
         },
       },
       '/v1/polymarket-alpha': {
         get: {
-          summary: 'Get Polymarket High-Volume Opportunities',
+          summary: 'Get Polymarket High-Volume Opportunities (Tier: $0.01)',
           responses: {
             '200': { description: 'Active prediction markets and spreads' },
             '402': { description: 'Payment required via L402 or x402' },
@@ -236,7 +287,27 @@ app.get('/openapi.json', (c) => {
   });
 });
 
-// 5. Token Alpha Analysis (Protected by 402 Paywall)
+// 5. Fast Security Check & Honeypot Detector (Micro-Tier: $0.005 / 5 sats)
+app.get('/v1/security-check', paywall402({ costUsdc: 0.005, costSats: 5 }), async (c) => {
+  const address = c.req.query('address');
+  const network = (c.req.query('network') || 'base').toLowerCase() as Network;
+
+  if (!address) {
+    return c.json({ error: 'Missing required query parameter: address' }, 400);
+  }
+
+  const securityReport = await fetchSecurityReport(network, address);
+  return c.json({
+    success: true,
+    paymentVerifiedBy: c.get('paymentType'),
+    network,
+    address,
+    security: securityReport,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// 6. Full Token Alpha Analysis (Tier: $0.02 / 20 sats)
 app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (c) => {
   const address = c.req.query('address');
   const network = (c.req.query('network') || 'base').toLowerCase() as Network;

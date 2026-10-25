@@ -19,6 +19,26 @@ const rl = readline.createInterface({
 
 const TOOLS = [
   {
+    name: 'check_token_security',
+    description:
+      'Fast anti-honeypot and smart contract security audit (checks honeypots, high buy/sell tax, blacklist, freeze authority, balance modification). Micro-tier: $0.005.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        network: {
+          type: 'string',
+          enum: ['base', 'solana', 'ethereum', 'bsc', 'arbitrum', 'polygon'],
+          description: 'Blockchain network (default is base)',
+        },
+        address: {
+          type: 'string',
+          description: 'The smart contract address or token mint address',
+        },
+      },
+      required: ['address'],
+    },
+  },
+  {
     name: 'get_token_alpha',
     description:
       'Performs real-time security audit (is_honeypot, sell taxes, balance modifications), volume momentum analysis, and liquidity depth scoring for any token. Supports Base, Solana, Ethereum, BSC, Arbitrum.',
@@ -83,6 +103,26 @@ rl.on('line', async (line) => {
     if (method === 'tools/call') {
       const toolName = params?.name;
       const args = params?.arguments || {};
+
+      if (toolName === 'check_token_security') {
+        const address = args.address;
+        const network = (args.network || 'base').toLowerCase() as Network;
+
+        const securityReport = await fetchSecurityReport(network, address);
+        sendResponse({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(securityReport, null, 2),
+              },
+            ],
+          },
+        });
+        return;
+      }
 
       if (toolName === 'get_token_alpha') {
         const address = args.address;

@@ -1,23 +1,35 @@
 {
   "$schema": "https://glama.ai/mcp/glama.schema.json",
   "name": "Alpha402",
-  "description": "Real-time on-chain alpha, anti-honeypot contract security audits, and prediction market arbitrage signals for autonomous AI agents.",
+  "description": "Real-time on-chain alpha, anti-honeypot contract security audits, and prediction market arbitrage signals for autonomous AI agents. Supports Base, Solana, Ethereum with HTTP 402 native micropayments and 3 free trial queries via ?demo=true.",
   "maintainers": [
     "monsterbyurbed11"
   ],
   "categories": [
     "cryptocurrency",
     "blockchain",
-    "finance"
+    "finance",
+    "developer-tools"
   ],
   "keywords": [
+    "ai-agents",
+    "crypto",
+    "dex",
+    "honeypot",
+    "honeypot-detector",
+    "security-audit",
+    "base",
+    "solana",
+    "trading-bot",
     "http-402",
     "l402",
     "x402",
-    "crypto",
-    "dex",
+    "agentic-payments",
     "alpha",
-    "honeypot",
-    "ai-agents"
+    "defi",
+    "arbitrage",
+    "polymarket",
+    "dexscreener",
+    "elizaos"
   ]
 }

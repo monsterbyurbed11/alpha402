@@ -5,6 +5,7 @@ export interface PaywallConfig {
   costSats: number; // e.g. 20 sats
   baseRecipientAddress: string;
   enableSandbox: boolean; // allows 'TEST_PREIMAGE' or '?demo=true' for local testing
+  maxDemoQueries?: number; // default: 3 free queries before requiring 402 payment
 }
 
 export const DEFAULT_CONFIG: PaywallConfig = {
@@ -12,20 +13,45 @@ export const DEFAULT_CONFIG: PaywallConfig = {
   costSats: 20,
   baseRecipientAddress: '0x8a8c238ed2b46908Ff6C6922a3870984f20f8913', // replace with creator's wallet
   enableSandbox: true,
+  maxDemoQueries: 3,
 };
 
 // In-memory nonce store (for Cloudflare Workers, can be backed by Upstash or KV)
 const spentTokens = new Set<string>();
 
+// Track free demo trial queries per client identifier (IP or test session)
+const demoUsageMap = new Map<string, number>();
+
 export function paywall402(config: Partial<PaywallConfig> = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
+  const maxDemo = cfg.maxDemoQueries ?? 3;
 
   return async function (c: Context, next: Next) {
-    // 1. Check for free bypass / demo testing
+    // Determine client identifier for demo quota tracking
+    const clientIp =
+      c.req.header('cf-connecting-ip') ||
+      c.req.header('x-real-ip') ||
+      c.req.header('x-forwarded-for')?.split(',')[0].trim() ||
+      'sandbox_tester';
+
+    // 1. Check for free bypass / demo testing (limited to maxDemo queries)
     const isDemo = c.req.query('demo') === 'true';
     if (cfg.enableSandbox && isDemo) {
-      c.set('paymentType', 'demo_sandbox');
-      return await next();
+      const currentUsage = demoUsageMap.get(clientIp) || 0;
+
+      if (currentUsage < maxDemo) {
+        demoUsageMap.set(clientIp, currentUsage + 1);
+        const remaining = maxDemo - (currentUsage + 1);
+        
+        c.header('X-Demo-Trial', 'active');
+        c.header('X-Demo-Used', (currentUsage + 1).toString());
+        c.header('X-Demo-Remaining', remaining.toString());
+        c.set('paymentType', `demo_sandbox_trial_${currentUsage + 1}_of_${maxDemo}`);
+        
+        return await next();
+      }
+
+      // If demo limit reached, proceed to 402 challenge below with an explicit note
     }
 
     const authHeader = c.req.header('Authorization');
@@ -82,11 +108,16 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
     c.header('X-402-Cost-Sats', cfg.costSats.toString());
     c.header('X-402-Payment-Recipient', cfg.baseRecipientAddress);
 
+    const currentUsage = demoUsageMap.get(clientIp) || 0;
+    const isQuotaExceeded = isDemo && currentUsage >= maxDemo;
+
     return c.json(
       {
-        error: 'Payment Required',
+        error: isQuotaExceeded ? 'Free Demo Limit Reached' : 'Payment Required',
         statusCode: 402,
-        message: 'This API requires micro-payment from your AI Agent wallet.',
+        message: isQuotaExceeded
+          ? `You have used all ${maxDemo} free trial queries for your client. Please authenticate with your AI Agent wallet via L402 or x402 to continue.`
+          : 'This API requires micro-payment from your AI Agent wallet.',
         pricing: {
           costUsdc: cfg.costUsdc,
           costSats: cfg.costSats,
@@ -108,7 +139,13 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
         },
         sandboxTesting: cfg.enableSandbox
           ? {
-              note: 'Testing mode enabled. Add header "Authorization: L402 test_token:TEST_PREIMAGE_OK" or query param "?demo=true" to test without crypto.',
+              demoLimit: maxDemo,
+              demoUsed: currentUsage,
+              demoRemaining: Math.max(0, maxDemo - currentUsage),
+              instructions:
+                currentUsage < maxDemo
+                  ? `Add '?demo=true' to your request for ${maxDemo - currentUsage} more free trial queries.`
+                  : 'Free demo trial exhausted. Fund your agent wallet with Base USDC or Lightning sats.',
             }
           : undefined,
       },

@@ -1,16 +1,34 @@
 # 🚀 Alpha402 - HTTP 402 Real-Time On-Chain Alpha API for AI Agents
 
+[![Glama MCP](https://glama.ai/mcp/badge)](https://glama.ai/mcp/servers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![HTTP 402](https://img.shields.io/badge/Payment-HTTP%20402%20(x402%20%2F%20L402)-blue)](https://x402.org)
+
 An autonomous, pay-per-request intelligence API built for **AI Agents**. Provides real-time DEX liquidity metrics, volume momentum spikes, anti-honeypot contract audits, and prediction market arbitrage opportunities via the **HTTP 402 Payment Required** standard.
 
-Runs on **$0/month infrastructure** using Cloudflare Workers, free public Web3 APIs (DexScreener, GoPlus Security, Polymarket), and native micro-payment settlement (Bitcoin Lightning L402 & EVM/Base x402).
+Runs on **$0/month infrastructure** using Cloudflare Workers, free public Web3 APIs (DexScreener, GoPlus Security, Polymarket), and native micro-payment settlement (Bitcoin Lightning L402 & EVM/Base x402). Includes **3 free demo trial queries** per client (`?demo=true`) for easy testing in registries like Glama and Smithery.
+
+---
+
+## 💎 Tiered Micro-Pricing Architecture
+
+Built for different agent frequencies—from high-throughput memecoin scanners to strategic deep-dive traders:
+
+| Endpoint / Tool | Price (USDC / Sats) | Target Agent Use-Case |
+| :--- | :--- | :--- |
+| **`GET /v1/security-check`** (`check_token_security`) | **$0.005** / 5 sats | **High-Frequency Scanners**: Rapid honeypot, blacklist, sell tax, and freeze check. |
+| **`GET /v1/token-alpha`** (`get_token_alpha`) | **$0.020** / 20 sats | **Trade Decision Engine**: Full Alpha Score (0-100), volume momentum spike, buy/sell ratios, and LLM summary prompt. |
+| **`GET /v1/polymarket-alpha`** (`get_polymarket_alpha`) | **$0.010** / 10 sats | **Arbitrage Bots**: High-volume event predictions, binary spreads, and resolution dates. |
+| **Free Sandbox Trial** | **$0.000** (First 3 queries) | **Developer & Registry Sandbox**: Add `?demo=true` for 3 instant zero-crypto test calls. |
 
 ---
 
 ## 🌟 Key Features
 
-1. **HTTP 402 Paywall Layer:**
+1. **HTTP 402 Paywall Layer with 3 Free Demo Trials:**
    * Returns `402 Payment Required` with `WWW-Authenticate: L402` and `x402` headers when no payment is present.
-   * Autonomous AI agents parse the challenge, pay a micro-transaction (e.g. $0.02 USDC or 20 sats), and retry with payment proof in the `Authorization` header.
+   * New developers & testing agents can pass `?demo=true` to test up to 3 queries for free (`X-Demo-Remaining: 2`, `1`, `0`).
+   * Once exhausted, autonomous AI agents pay micro-transactions ($0.005–$0.02 USDC or sats) and retry with payment proof in the `Authorization` header.
    * Built-in nonce tracking to prevent replay attacks and double-spending.
 
 2. **Real-Time On-Chain Alpha & Anti-Honeypot Engine:**
@@ -22,7 +40,7 @@ Runs on **$0/month infrastructure** using Cloudflare Workers, free public Web3 A
    * Tracks high-volume prediction markets, event resolution dates, and binary spread opportunities.
 
 4. **Model Context Protocol (MCP) Server:**
-   * Includes a native stdio MCP server (`src/mcp/server.ts`) so Claude Desktop, Cursor, and autonomous agent frameworks can discover and invoke the API natively as a tool.
+   * Fully indexed for **Glama** and **Smithery** with both stdio (`src/mcp/server.ts`) and remote HTTP (`POST /mcp`) transports.
 
 ---
 

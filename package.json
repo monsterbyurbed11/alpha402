@@ -12,13 +12,22 @@
     "build": "tsc"
   },
   "keywords": [
+    "ai-agents",
     "http-402",
     "l402",
     "x402",
-    "ai-agents",
     "crypto",
     "dex",
     "alpha",
+    "honeypot",
+    "honeypot-detector",
+    "security-audit",
+    "base",
+    "solana",
+    "trading-bot",
+    "agentic-payments",
+    "elizaos",
+    "polymarket",
     "mcp"
   ],
   "author": "",
