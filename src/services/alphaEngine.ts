@@ -13,7 +13,7 @@ export function computeAlphaSignal(
     if (security.isHoneypot === true || security.ownerCanChangeBalance === true) {
       securityScore = 0; // Hard zero for honeypots or balance modification
     } else {
-      let score = 100 - (security.riskCount * 8);
+      let score = 100 - security.riskCount * 8;
       if (!security.isOpenSource) score -= 20;
       if (security.buyTax > 5) score -= (security.buyTax - 5) * 2;
       if (security.sellTax > 5) score -= (security.sellTax - 5) * 3;
@@ -24,7 +24,7 @@ export function computeAlphaSignal(
 
   // 2. Liquidity Score (0 - 100)
   let liquidityScore = 0;
-  const liq = dexData.liquidityUsd;
+  const liq = Math.max(0, Number.isFinite(dexData.liquidityUsd) ? dexData.liquidityUsd : 0);
   if (liq < 10000) liquidityScore = Math.round((liq / 10000) * 20);
   else if (liq < 50000) liquidityScore = 20 + Math.round(((liq - 10000) / 40000) * 30);
   else if (liq < 250000) liquidityScore = 50 + Math.round(((liq - 50000) / 200000) * 30);
@@ -34,8 +34,9 @@ export function computeAlphaSignal(
   // 3. Pool Age & Age-Graduated Discounting
   let poolAgeHours: number | null = null;
   let poolAgeDiscountApplied = 1.0;
-  if (dexData.pairCreatedAt) {
-    poolAgeHours = parseFloat(((Date.now() - dexData.pairCreatedAt) / (1000 * 60 * 60)).toFixed(1));
+  if (dexData.pairCreatedAt && Number.isFinite(dexData.pairCreatedAt)) {
+    const rawAgeHours = Math.max(0, (Date.now() - dexData.pairCreatedAt) / (1000 * 60 * 60));
+    poolAgeHours = parseFloat(rawAgeHours.toFixed(1));
     // Pools < 24h old get momentum dampened proportionally to their age (e.g. 2h pool = 2/24 = 0.083 -> capped at 0.1 min)
     poolAgeDiscountApplied = parseFloat(Math.min(1.0, Math.max(0.1, poolAgeHours / 24)).toFixed(2));
   } else {
@@ -43,7 +44,7 @@ export function computeAlphaSignal(
   }
 
   // 4. Wash-Trading Heuristics
-  // Catches: 
+  // Catches:
   // - High 5m volume with low transaction counts (<= 3 txns)
   // - Unusually large avg transaction size (> 15% of total pool liquidity)
   // - Low trade count in 1h with high volume (> 2x liquidity with < 20 transactions)
@@ -53,12 +54,12 @@ export function computeAlphaSignal(
 
   const possibleWashTrading =
     (dexData.volume.m5 > 5000 && tx5mTotal <= 3) ||
-    (avgTxSize5m > 0 && avgTxSize5m > dexData.liquidityUsd * 0.15) ||
-    (dexData.volume.h1 > dexData.liquidityUsd * 2 && tx1hTotal < 20);
+    (avgTxSize5m > 0 && avgTxSize5m > liq * 0.15) ||
+    (dexData.volume.h1 > liq * 2 && tx1hTotal < 20);
 
   // 5. Momentum Score (0 - 100)
-  const buys1h = dexData.txns.h1.buys;
-  const sells1h = dexData.txns.h1.sells;
+  const buys1h = dexData.txns.h1.buys || 0;
+  const sells1h = dexData.txns.h1.sells || 0;
   const buyRatio1h = tx1hTotal > 0 ? buys1h / Math.max(1, sells1h) : 1;
 
   const vol5mExpected = dexData.volume.h1 / 12;
@@ -91,7 +92,7 @@ export function computeAlphaSignal(
     if (security.isHoneypot === true || security.ownerCanChangeBalance === true) {
       alphaScore = 0; // Hard ZERO
     } else {
-      alphaScore = Math.round((securityScore * 0.40) + (momentumScore * 0.35) + (liquidityScore * 0.25));
+      alphaScore = Math.round(securityScore * 0.4 + momentumScore * 0.35 + liquidityScore * 0.25);
     }
   }
 
@@ -150,9 +151,9 @@ export function computeAlphaSignal(
       priceUsd: dexData.priceUsd,
       priceChange1h: dexData.priceChange.h1,
       priceChange24h: dexData.priceChange.h24,
-      liquidityUsd: Math.round(dexData.liquidityUsd),
-      fdv: Math.round(dexData.fdv),
-      volume24h: Math.round(dexData.volume.h24),
+      liquidityUsd: Math.round(liq),
+      fdv: Math.round(dexData.fdv || 0),
+      volume24h: Math.round(dexData.volume.h24 || 0),
     },
     securityAudit: {
       auditStatus: security.auditStatus,
@@ -166,7 +167,7 @@ export function computeAlphaSignal(
     },
     scoringMethodology: {
       weights: {
-        security: 0.40,
+        security: 0.4,
         momentum: 0.35,
         liquidity: 0.25,
       },

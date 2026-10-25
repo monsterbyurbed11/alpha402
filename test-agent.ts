@@ -4,6 +4,8 @@
  * 1. Request -> 402 Payment Required
  * 2. Parses challenge -> Pays micro-invoice from agent wallet
  * 3. Re-requests with Authorization proof -> Receives Alpha Signal
+ *
+ * Note: To run this simulation with TEST_PREIMAGE_OK, start the server with ENABLE_SANDBOX=true.
  */
 
 const API_BASE = process.env.API_BASE || 'http://localhost:8402';
@@ -64,7 +66,7 @@ async function runAgent() {
     console.log(`Liquidity Score:     ${data.data.signals.liquidityScore} / 100`);
     console.log(`1h Buy/Sell Ratio:   ${data.data.signals.buyPressureRatio1h}x`);
     console.log(`Is Honeypot:         ${data.data.securityAudit.isHoneypot ? 'YES ⚠️' : 'NO ✅'}`);
-    console.log(`Buy / Sell Tax:      ${data.data.securityAudit.buyTax} / ${data.data.securityAudit.sellTax}`);
+    console.log(`Buy / Sell Tax:      ${data.data.securityAudit.buyTax}% / ${data.data.securityAudit.sellTax}%`);
     console.log(`Price USD:           $${data.data.marketSummary.priceUsd}`);
     console.log(`Liquidity USD:       $${data.data.marketSummary.liquidityUsd.toLocaleString()}`);
     console.log(`------------------------------------------------------`);

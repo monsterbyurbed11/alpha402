@@ -3,6 +3,6 @@ main = "src/index.ts"
 compatibility_date = "2024-10-01"
 
 [vars]
-ENABLE_SANDBOX = "true"
+ENABLE_SANDBOX = "false"
 COST_USDC = "0.02"
 COST_SATS = "20"

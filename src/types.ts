@@ -1,5 +1,43 @@
 export type Network = 'base' | 'ethereum' | 'solana' | 'bsc' | 'arbitrum' | 'polygon';
 
+export const SUPPORTED_NETWORKS: readonly Network[] = [
+  'base',
+  'ethereum',
+  'solana',
+  'bsc',
+  'arbitrum',
+  'polygon',
+] as const;
+
+export function isValidNetwork(network: string): network is Network {
+  return (SUPPORTED_NETWORKS as readonly string[]).includes(network);
+}
+
+export function isValidTokenAddress(network: Network, address: string): boolean {
+  if (!address || typeof address !== 'string') return false;
+  const trimmed = address.trim();
+  if (network === 'solana') {
+    return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmed);
+  }
+  return /^0x[a-fA-F0-9]{40}$/.test(trimmed);
+}
+
+export interface AppBindings {
+  ENABLE_SANDBOX?: string;
+  COST_USDC?: string;
+  COST_SATS?: string;
+  UPSTASH_REDIS_REST_URL?: string;
+  UPSTASH_REDIS_REST_TOKEN?: string;
+  L402_HMAC_SECRET?: string;
+  BASE_RPC_URL?: string;
+  BASE_RECIPIENT_ADDRESS?: string;
+}
+
+export interface AppVariables {
+  paymentType: string;
+  paymentProof: string;
+}
+
 export interface TokenAlphaRequest {
   network: Network;
   address: string;

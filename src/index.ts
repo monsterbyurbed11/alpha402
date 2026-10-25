@@ -5,9 +5,16 @@ import { fetchDexData } from './services/dexscreener.js';
 import { fetchSecurityReport } from './services/goplus.js';
 import { fetchPolymarketAlpha } from './services/polymarket.js';
 import { computeAlphaSignal } from './services/alphaEngine.js';
-import { Network } from './types.js';
+import {
+  Network,
+  AppBindings,
+  AppVariables,
+  SUPPORTED_NETWORKS,
+  isValidNetwork,
+  isValidTokenAddress,
+} from './types.js';
 
-const app = new Hono();
+const app = new Hono<{ Bindings: AppBindings; Variables: AppVariables }>();
 
 // Enable CORS for web-based agent frontends & MCP web bridges
 app.use('*', cors());
@@ -18,7 +25,7 @@ app.get('/', (c) => {
     name: 'Alpha402 - Agent On-Chain Alpha API',
     version: '1.4.0',
     description: 'Cryptographically and RPC-verified, fail-closed on-chain alpha engine for autonomous AI agents.',
-    paymentProtocol: 'HTTP 402 (Base USDC on-chain verified / L402 Lightning SHA-256)',
+    paymentProtocol: 'HTTP 402 (Base USDC on-chain verified / L402 Lightning HMAC + SHA-256)',
     endpoints: {
       mcp: '/mcp',
       tokenAlpha: '/v1/token-alpha?network=base&address=0x...',
@@ -55,7 +62,7 @@ app.get('/.well-known/agent.json', (c) => {
         parameters: {
           type: 'object',
           properties: {
-            network: { type: 'string', enum: ['base', 'solana', 'ethereum', 'bsc', 'arbitrum', 'polygon'], default: 'base' },
+            network: { type: 'string', enum: [...SUPPORTED_NETWORKS], default: 'base' },
             address: { type: 'string', description: 'Token contract address' },
           },
           required: ['address'],
@@ -73,15 +80,35 @@ app.get('/.well-known/agent.json', (c) => {
 // 3. HTTP MCP Endpoint for Smithery, Cursor & Claude (Streamable & JSON-RPC)
 const MCP_TOOLS = [
   {
-    name: 'get_token_alpha',
+    name: 'check_token_security',
     description:
-      'Performs fail-closed real-time security audit (is_honeypot, sell taxes, balance modifications), volume momentum analysis, and liquidity depth scoring for any token. Supports Base, Solana, Ethereum, BSC, Arbitrum.',
+      'Fast fail-closed anti-honeypot and smart contract security audit (checks honeypots, high buy/sell tax, blacklist, freeze authority, balance modification). Micro-tier: $0.005 USDC / 5 sats.',
     inputSchema: {
       type: 'object',
       properties: {
         network: {
           type: 'string',
-          enum: ['base', 'solana', 'ethereum', 'bsc', 'arbitrum', 'polygon'],
+          enum: [...SUPPORTED_NETWORKS],
+          description: 'Blockchain network (default is base)',
+        },
+        address: {
+          type: 'string',
+          description: 'The smart contract address or token mint address',
+        },
+      },
+      required: ['address'],
+    },
+  },
+  {
+    name: 'get_token_alpha',
+    description:
+      'Performs fail-closed real-time security audit (is_honeypot, sell taxes, balance modifications), volume momentum analysis, and liquidity depth scoring for any token. Supports Base, Solana, Ethereum, BSC, Arbitrum, Polygon.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        network: {
+          type: 'string',
+          enum: [...SUPPORTED_NETWORKS],
           description: 'Blockchain network (default is base)',
         },
         address: {
@@ -113,97 +140,277 @@ app.get('/mcp', (c) => {
 });
 
 app.post('/mcp', async (c) => {
+  let body: any;
   try {
-    const body: any = await c.req.json();
-    const { id, method, params } = body;
-
-    if (method === 'initialize') {
-      return c.json({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          protocolVersion: '2024-11-05',
-          capabilities: { tools: {} },
-          serverInfo: {
-            name: 'alpha402-intelligence-mcp',
-            version: '1.4.0',
-          },
-        },
-      });
-    }
-
-    if (method === 'tools/list') {
-      return c.json({
-        jsonrpc: '2.0',
-        id,
-        result: { tools: MCP_TOOLS },
-      });
-    }
-
-    if (method === 'tools/call') {
-      const toolName = params?.name;
-      const args = params?.arguments || {};
-
-      if (toolName === 'get_token_alpha') {
-        const address = args.address;
-        const network = (args.network || 'base').toLowerCase() as Network;
-
-        const [dexData, securityReport] = await Promise.all([
-          fetchDexData(address, network),
-          fetchSecurityReport(network, address),
-        ]);
-
-        if (!dexData) {
-          return c.json({
-            jsonrpc: '2.0',
-            id,
-            result: {
-              content: [{ type: 'text', text: `No active liquidity pools found for ${address} on ${network}.` }],
-              isError: true,
-            },
-          });
-        }
-
-        const alphaSignal = computeAlphaSignal(network, dexData, securityReport);
-        return c.json({
-          jsonrpc: '2.0',
-          id,
-          result: {
-            content: [{ type: 'text', text: JSON.stringify(alphaSignal, null, 2) }],
-          },
-        });
-      }
-
-      if (toolName === 'get_polymarket_alpha') {
-        const markets = await fetchPolymarketAlpha();
-        return c.json({
-          jsonrpc: '2.0',
-          id,
-          result: {
-            content: [{ type: 'text', text: JSON.stringify(markets, null, 2) }],
-          },
-        });
-      }
-
-      return c.json({
-        jsonrpc: '2.0',
-        id,
-        error: { code: -32601, message: `Tool not found: ${toolName}` },
-      });
-    }
-
-    return c.json({
-      jsonrpc: '2.0',
-      id: id || null,
-      result: {},
-    });
+    body = await c.req.json();
   } catch (err: any) {
     return c.json({
       jsonrpc: '2.0',
       id: null,
-      error: { code: -32700, message: `Parse error: ${err.message}` },
+      error: { code: -32700, message: `Parse error: ${err?.message || 'Invalid JSON'}` },
     });
   }
+
+  const { id, method, params } = body || {};
+
+  if (method === 'initialize') {
+    return c.json({
+      jsonrpc: '2.0',
+      id: id ?? null,
+      result: {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: {
+          name: 'alpha402-intelligence-mcp',
+          version: '1.4.0',
+        },
+      },
+    });
+  }
+
+  if (method === 'notifications/initialized') {
+    return c.body(null, 204);
+  }
+
+  if (method === 'ping') {
+    return c.json({
+      jsonrpc: '2.0',
+      id: id ?? null,
+      result: {},
+    });
+  }
+
+  if (method === 'tools/list') {
+    return c.json({
+      jsonrpc: '2.0',
+      id: id ?? null,
+      result: { tools: MCP_TOOLS },
+    });
+  }
+
+  if (method === 'tools/call') {
+    const toolName = params?.name;
+    const args = params?.arguments || {};
+
+    if (!['check_token_security', 'get_token_alpha', 'get_polymarket_alpha'].includes(toolName)) {
+      return c.json({
+        jsonrpc: '2.0',
+        id: id ?? null,
+        error: { code: -32601, message: `Tool not found: ${String(toolName)}` },
+      });
+    }
+
+    // Validate tool arguments BEFORE charging payment proof
+    if (toolName === 'check_token_security' || toolName === 'get_token_alpha') {
+      const rawNetwork = String(args.network || 'base').toLowerCase();
+      const address = typeof args.address === 'string' ? args.address.trim() : '';
+
+      if (!isValidNetwork(rawNetwork)) {
+        return c.json({
+          jsonrpc: '2.0',
+          id: id ?? null,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: `Unsupported network "${rawNetwork}". Supported networks: ${SUPPORTED_NETWORKS.join(', ')}`,
+                }),
+              },
+            ],
+            isError: true,
+          },
+        });
+      }
+
+      if (!isValidTokenAddress(rawNetwork, address)) {
+        return c.json({
+          jsonrpc: '2.0',
+          id: id ?? null,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: `Invalid token contract address "${address}" for network "${rawNetwork}".`,
+                }),
+              },
+            ],
+            isError: true,
+          },
+        });
+      }
+    }
+
+    // Enforce HTTP 402 paywall on remote HTTP tool executions to prevent free paywall bypass
+    const tierCosts =
+      toolName === 'check_token_security'
+        ? { costUsdc: 0.005, costSats: 5 }
+        : toolName === 'get_polymarket_alpha'
+          ? { costUsdc: 0.01, costSats: 10 }
+          : { costUsdc: 0.02, costSats: 20 };
+
+    let authorized = false;
+    const paywallResponse = await paywall402(tierCosts)(c, async () => {
+      authorized = true;
+    });
+
+    if (!authorized && paywallResponse) {
+      return paywallResponse;
+    }
+
+    const isDemo = c.get('paymentType') === 'demo_sandbox';
+
+    if (toolName === 'check_token_security') {
+      const address = String(args.address).trim();
+      const network = String(args.network || 'base').toLowerCase() as Network;
+      const securityReport = await fetchSecurityReport(network, address);
+
+      if (securityReport.auditStatus !== 'VERIFIED') {
+        const released = await releaseNonce(c);
+        return c.json({
+          jsonrpc: '2.0',
+          id: id ?? null,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error: 'Security audit unavailable or timed out. Failing closed.',
+                    auditStatus: securityReport.auditStatus,
+                    reusableCredit: isDemo ? true : released,
+                    charged: isDemo ? false : !released,
+                    securityReport,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+            isError: true,
+          },
+        });
+      }
+
+      return c.json({
+        jsonrpc: '2.0',
+        id: id ?? null,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(securityReport, null, 2) }],
+        },
+      });
+    }
+
+    if (toolName === 'get_token_alpha') {
+      const address = String(args.address).trim();
+      const network = String(args.network || 'base').toLowerCase() as Network;
+
+      const [dexData, securityReport] = await Promise.all([
+        fetchDexData(address, network),
+        fetchSecurityReport(network, address),
+      ]);
+
+      if (!dexData) {
+        const released = await releaseNonce(c);
+        return c.json({
+          jsonrpc: '2.0',
+          id: id ?? null,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: `No active liquidity pools found for ${address} on ${network}.`,
+                  reusableCredit: isDemo ? true : released,
+                  charged: isDemo ? false : !released,
+                }),
+              },
+            ],
+            isError: true,
+          },
+        });
+      }
+
+      if (securityReport.auditStatus !== 'VERIFIED') {
+        const released = await releaseNonce(c);
+        return c.json({
+          jsonrpc: '2.0',
+          id: id ?? null,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error: 'Security audit unavailable or timed out. Failing closed.',
+                    auditStatus: securityReport.auditStatus,
+                    reusableCredit: isDemo ? true : released,
+                    charged: isDemo ? false : !released,
+                    data: null,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+            isError: true,
+          },
+        });
+      }
+
+      const alphaSignal = computeAlphaSignal(network, dexData, securityReport);
+      return c.json({
+        jsonrpc: '2.0',
+        id: id ?? null,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(alphaSignal, null, 2) }],
+        },
+      });
+    }
+
+    if (toolName === 'get_polymarket_alpha') {
+      const markets = await fetchPolymarketAlpha();
+      if (!markets) {
+        const released = await releaseNonce(c);
+        return c.json({
+          jsonrpc: '2.0',
+          id: id ?? null,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: 'Polymarket upstream service unavailable or timed out.',
+                  reusableCredit: isDemo ? true : released,
+                  charged: isDemo ? false : !released,
+                }),
+              },
+            ],
+            isError: true,
+          },
+        });
+      }
+
+      return c.json({
+        jsonrpc: '2.0',
+        id: id ?? null,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(markets, null, 2) }],
+        },
+      });
+    }
+  }
+
+  return c.json({
+    jsonrpc: '2.0',
+    id: id ?? null,
+    error: { code: -32601, message: `Method not found: ${String(method)}` },
+  });
 });
 
 // 4. OpenAPI 3.1 Specification with Complete Response Schemas (Free)
@@ -235,7 +442,7 @@ app.get('/openapi.json', (c) => {
               in: 'query',
               required: false,
               description: 'Blockchain network',
-              schema: { type: 'string', enum: ['base', 'solana', 'ethereum', 'bsc', 'arbitrum', 'polygon'], default: 'base' },
+              schema: { type: 'string', enum: [...SUPPORTED_NETWORKS], default: 'base' },
             },
           ],
           responses: {
@@ -292,6 +499,16 @@ app.get('/openapi.json', (c) => {
                 'application/json': {
                   schema: {
                     $ref: '#/components/schemas/PaymentRequiredResponse',
+                  },
+                },
+              },
+            },
+            '503': {
+              description: 'Polymarket upstream unavailable - payment proof released as reusable credit',
+              content: {
+                'application/json': {
+                  schema: {
+                    $ref: '#/components/schemas/AuditUnavailableResponse',
                   },
                 },
               },
@@ -371,7 +588,7 @@ app.get('/openapi.json', (c) => {
                     weights: {
                       type: 'object',
                       properties: {
-                        security: { type: 'number', example: 0.40 },
+                        security: { type: 'number', example: 0.4 },
                         momentum: { type: 'number', example: 0.35 },
                         liquidity: { type: 'number', example: 0.25 },
                       },
@@ -439,6 +656,8 @@ app.get('/openapi.json', (c) => {
           type: 'object',
           properties: {
             success: { type: 'boolean' },
+            charged: { type: 'boolean' },
+            reusableCredit: { type: 'boolean' },
             count: { type: 'number' },
             opportunities: {
               type: 'array',
@@ -465,74 +684,146 @@ app.get('/openapi.json', (c) => {
 
 // 5. Token Alpha Analysis (Protected by 402 Paywall)
 app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (c) => {
-  const address = c.req.query('address');
-  const network = (c.req.query('network') || 'base').toLowerCase() as Network;
+  const isDemo = c.get('paymentType') === 'demo_sandbox';
+  const rawAddress = c.req.query('address');
+  const rawNetwork = (c.req.query('network') || 'base').toLowerCase();
 
-  if (!address) {
-    return c.json({ error: 'Missing required query parameter: address' }, 400);
-  }
-
-  // Query DexScreener & GoPlus concurrently (Zero added latency)
-  const [dexData, securityReport] = await Promise.all([
-    fetchDexData(address, network),
-    fetchSecurityReport(network, address),
-  ]);
-
-  if (!dexData) {
-    // Release the nonce since we couldn't fulfill the core market lookup
-    await releaseNonce(c);
+  if (!rawAddress) {
+    const released = await releaseNonce(c);
     return c.json(
       {
         success: false,
-        error: `No active liquidity pools found for address ${address} on network ${network}.`,
-        reusableCredit: true,
-        charged: false,
-        suggestion: 'Verify the token contract address. Your payment proof remains valid and reusable.',
+        error: 'Missing required query parameter: address',
+        reusableCredit: isDemo ? true : released,
+        charged: isDemo ? false : !released,
       },
-      404
+      400
     );
   }
 
-  // Set audit status header so trading agents can inspect header directly
-  c.header('X-Alpha402-Audit-Status', securityReport.auditStatus);
-
-  const isAuditVerified = securityReport.auditStatus === 'VERIFIED';
-
-  // CRITICAL FAIL-CLOSED & ANTI-EXPLOIT:
-  // If audit failed, release the nonce key so proof is reusable, BUT WITHHOLD DATA!
-  // No free data leak for unindexed tokens.
-  if (!isAuditVerified) {
-    await releaseNonce(c);
+  if (!isValidNetwork(rawNetwork)) {
+    const released = await releaseNonce(c);
     return c.json(
       {
         success: false,
-        error: 'Security audit unavailable or timed out. Failing closed.',
-        auditStatus: securityReport.auditStatus,
-        reusableCredit: true,
-        charged: false,
-        message: 'Upstream audit failed. Payment proof was NOT consumed and remains a reusable credit. Data withheld to prevent unverified trading.',
+        error: `Unsupported network "${rawNetwork}". Supported networks: ${SUPPORTED_NETWORKS.join(', ')}`,
+        reusableCredit: isDemo ? true : released,
+        charged: isDemo ? false : !released,
+      },
+      400
+    );
+  }
+
+  const address = rawAddress.trim();
+  const network: Network = rawNetwork;
+
+  if (!isValidTokenAddress(network, address)) {
+    const released = await releaseNonce(c);
+    return c.json(
+      {
+        success: false,
+        error: `Invalid token contract address format for network "${network}".`,
+        reusableCredit: isDemo ? true : released,
+        charged: isDemo ? false : !released,
+      },
+      400
+    );
+  }
+
+  try {
+    // Query DexScreener & GoPlus concurrently (Zero added latency)
+    const [dexData, securityReport] = await Promise.all([
+      fetchDexData(address, network),
+      fetchSecurityReport(network, address),
+    ]);
+
+    if (!dexData) {
+      // Release the nonce since we couldn't fulfill the core market lookup
+      const released = await releaseNonce(c);
+      return c.json(
+        {
+          success: false,
+          error: `No active liquidity pools found for address ${address} on network ${network}.`,
+          reusableCredit: isDemo ? true : released,
+          charged: isDemo ? false : !released,
+          suggestion: 'Verify the token contract address. Your payment proof remains valid and reusable.',
+        },
+        404
+      );
+    }
+
+    // Set audit status header so trading agents can inspect header directly
+    c.header('X-Alpha402-Audit-Status', securityReport.auditStatus);
+
+    const isAuditVerified = securityReport.auditStatus === 'VERIFIED';
+
+    // CRITICAL FAIL-CLOSED & ANTI-EXPLOIT:
+    // If audit failed, release the nonce key so proof is reusable, BUT WITHHOLD DATA!
+    // No free data leak for unindexed tokens.
+    if (!isAuditVerified) {
+      const released = await releaseNonce(c);
+      return c.json(
+        {
+          success: false,
+          error: 'Security audit unavailable or timed out. Failing closed.',
+          auditStatus: securityReport.auditStatus,
+          reusableCredit: isDemo ? true : released,
+          charged: isDemo ? false : !released,
+          message:
+            'Upstream audit failed. Payment proof was NOT consumed and remains a reusable credit. Data withheld to prevent unverified trading.',
+          data: null,
+        },
+        503
+      );
+    }
+
+    const alphaResult = computeAlphaSignal(network, dexData, securityReport);
+
+    return c.json({
+      success: true,
+      charged: true,
+      reusableCredit: false,
+      paymentVerifiedBy: c.get('paymentType'),
+      data: alphaResult,
+    });
+  } catch (err: any) {
+    const released = await releaseNonce(c);
+    return c.json(
+      {
+        success: false,
+        error: 'Internal error while computing token alpha. Failing closed.',
+        reusableCredit: isDemo ? true : released,
+        charged: isDemo ? false : !released,
         data: null,
       },
       503
     );
   }
+});
 
-  const alphaResult = computeAlphaSignal(network, dexData, securityReport);
+// 6. Polymarket Alpha Signals (Protected by 402 Paywall)
+app.get('/v1/polymarket-alpha', paywall402({ costUsdc: 0.01, costSats: 10 }), async (c) => {
+  const isDemo = c.get('paymentType') === 'demo_sandbox';
+  const opportunities = await fetchPolymarketAlpha();
+
+  if (!opportunities) {
+    const released = await releaseNonce(c);
+    return c.json(
+      {
+        success: false,
+        error: 'Polymarket upstream service unavailable or timed out. Failing closed.',
+        reusableCredit: isDemo ? true : released,
+        charged: isDemo ? false : !released,
+        opportunities: null,
+      },
+      503
+    );
+  }
 
   return c.json({
     success: true,
     charged: true,
     reusableCredit: false,
-    paymentVerifiedBy: c.get('paymentType'),
-    data: alphaResult,
-  });
-});
-
-// 6. Polymarket Alpha Signals (Protected by 402 Paywall)
-app.get('/v1/polymarket-alpha', paywall402({ costUsdc: 0.01, costSats: 10 }), async (c) => {
-  const opportunities = await fetchPolymarketAlpha();
-  return c.json({
-    success: true,
     paymentVerifiedBy: c.get('paymentType'),
     count: opportunities.length,
     opportunities,
