@@ -1,8 +1,14 @@
 startCommand:
   type: stdio
-  config:
-    command: "npx"
-    args:
-      - "-y"
-      - "tsx"
-      - "src/mcp/server.ts"
+  configSchema:
+    type: object
+    properties:
+      alpha402TxHash:
+        type: string
+        description: "Optional prepaid Base USDC transaction hash (e.g. 0x...) for instant HTTP 402 credits"
+  commandFunction: |-
+    (config) => ({
+      command: 'node',
+      args: ['dist/mcp/server.js'],
+      env: config && config.alpha402TxHash ? { ALPHA402_TX_HASH: config.alpha402TxHash } : {}
+    })
