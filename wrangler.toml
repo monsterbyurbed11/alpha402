@@ -4,5 +4,10 @@ compatibility_date = "2024-10-01"
 
 [vars]
 ENABLE_SANDBOX = "false"
+FREE_TRIAL_DAILY_LIMIT = "3"
 COST_USDC = "0.02"
 COST_SATS = "20"
+
+[[kv_namespaces]]
+binding = "ALPHA402_KV"
+id = "dcc8898b942c44a1b8934ce26a39e328"

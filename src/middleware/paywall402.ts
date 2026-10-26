@@ -1,4 +1,5 @@
 import { Context, Next } from 'hono';
+import { recordAnalyticsEvent } from '../services/analytics.js';
 
 export interface PaywallConfig {
   costUsdc: number; // e.g. 0.02 ($0.02)
@@ -17,7 +18,13 @@ export const DEFAULT_CONFIG: PaywallConfig = {
 
 const BASE_USDC_CONTRACT = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
 const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-const DEFAULT_BASE_RPC_URL = 'https://mainnet.base.org';
+const DEFAULT_BASE_RPC_URL = 'https://base.gateway.tenderly.co';
+const FALLBACK_BASE_RPC_URLS = [
+  'https://base.gateway.tenderly.co',
+  'https://base-mainnet.public.blastapi.io',
+  'https://base.meowrpc.com',
+  'https://mainnet.base.org',
+];
 const DEFAULT_X402_FACILITATOR_URL = 'https://x402.org/facilitator';
 
 // Maximum age for initial on-chain Base USDC transaction registration: 43,200 blocks (~24 hours at 2s/block).
@@ -26,10 +33,11 @@ const MAX_TX_AGE_BLOCKS = 43200n;
 const NONCE_TTL_SECONDS = 86400 * 7; // 7 days
 const L402_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 
-// Local dev stores ONLY used when explicitly running offline with sandbox enabled (bounded to prevent memory DoS)
+// In-process caches used alongside Cloudflare KV / Upstash Redis (bounded to prevent memory DoS)
 const MAX_LOCAL_NONCES = 10000;
 const localSpentTokens = new Set<string>();
 const localCreditBalances = new Map<string, number>();
+const localFreeTrialCounts = new Map<string, number>();
 
 // Lua scripts for 1-roundtrip atomic prepaid credit accounting in Upstash Redis
 const LUA_TRY_SPEND_EXISTING = `
@@ -166,7 +174,7 @@ async function trySpendExistingCredits(
   creditKey: string,
   costUnits: number,
   env: Record<string, any>,
-  sandboxActive: boolean
+  _sandboxActive: boolean
 ): Promise<
   | { status: 'NOT_INDEXED' }
   | { status: 'CLAIMED'; remainingUnits: number }
@@ -192,21 +200,38 @@ async function trySpendExistingCredits(
     return { status: 'CLAIMED', remainingUnits: res.result };
   }
 
-  if (sandboxActive) {
-    if (!localCreditBalances.has(creditKey)) {
-      return { status: 'NOT_INDEXED' };
+  const kv = env.ALPHA402_KV;
+  if (kv && typeof kv.get === 'function') {
+    try {
+      let current: number | null = localCreditBalances.has(creditKey)
+        ? localCreditBalances.get(creditKey)!
+        : null;
+      if (current === null) {
+        const kvVal = await kv.get(`alpha402:credits:${creditKey}`);
+        if (kvVal === null) return { status: 'NOT_INDEXED' };
+        current = Number(kvVal);
+      }
+      if (!Number.isFinite(current)) return { status: 'NOT_INDEXED' };
+      if (current < costUnits) return { status: 'INSUFFICIENT_CREDITS' };
+      const rem = current - costUnits;
+      localCreditBalances.set(creditKey, rem);
+      await kv.put(`alpha402:credits:${creditKey}`, String(rem), { expirationTtl: NONCE_TTL_SECONDS });
+      return { status: 'CLAIMED', remainingUnits: rem };
+    } catch (e) {
+      console.error('Cloudflare KV credit read/write error:', e);
     }
-    const current = localCreditBalances.get(creditKey)!;
-    if (current < costUnits) {
-      return { status: 'INSUFFICIENT_CREDITS' };
-    }
-    const rem = current - costUnits;
-    localCreditBalances.set(creditKey, rem);
-    return { status: 'CLAIMED', remainingUnits: rem };
   }
 
-  console.error('FATAL: UPSTASH_REDIS_REST_URL not configured in production. Failing closed.');
-  return { status: 'STORE_ERROR' };
+  if (!localCreditBalances.has(creditKey)) {
+    return { status: 'NOT_INDEXED' };
+  }
+  const current = localCreditBalances.get(creditKey)!;
+  if (current < costUnits) {
+    return { status: 'INSUFFICIENT_CREDITS' };
+  }
+  const rem = current - costUnits;
+  localCreditBalances.set(creditKey, rem);
+  return { status: 'CLAIMED', remainingUnits: rem };
 }
 
 /**
@@ -218,7 +243,7 @@ async function initAndSpendCredits(
   costUnits: number,
   ttlSeconds: number,
   env: Record<string, any>,
-  sandboxActive: boolean
+  _sandboxActive: boolean
 ): Promise<
   | { status: 'CLAIMED'; remainingUnits: number }
   | { status: 'INSUFFICIENT_CREDITS' }
@@ -246,34 +271,54 @@ async function initAndSpendCredits(
     return { status: 'CLAIMED', remainingUnits: res.result };
   }
 
-  if (sandboxActive) {
-    const current = localCreditBalances.has(creditKey)
-      ? localCreditBalances.get(creditKey)!
-      : totalDepositUnits;
-    if (current < costUnits) {
-      return { status: 'INSUFFICIENT_CREDITS' };
+  let current = localCreditBalances.has(creditKey)
+    ? localCreditBalances.get(creditKey)!
+    : null;
+
+  const kv = env.ALPHA402_KV;
+  if (current === null && kv && typeof kv.get === 'function') {
+    try {
+      const kvVal = await kv.get(`alpha402:credits:${creditKey}`);
+      if (kvVal !== null && Number.isFinite(Number(kvVal))) {
+        current = Number(kvVal);
+      }
+    } catch {
+      // Fall back to totalDepositUnits
     }
-    if (!localCreditBalances.has(creditKey) && localCreditBalances.size >= MAX_LOCAL_NONCES) {
-      const oldest = localCreditBalances.keys().next().value;
-      if (oldest !== undefined) localCreditBalances.delete(oldest);
-    }
-    const rem = current - costUnits;
-    localCreditBalances.set(creditKey, rem);
-    return { status: 'CLAIMED', remainingUnits: rem };
   }
 
-  console.error('FATAL: UPSTASH_REDIS_REST_URL not configured in production. Failing closed.');
-  return { status: 'STORE_ERROR' };
+  const startingUnits = current !== null ? current : totalDepositUnits;
+  if (startingUnits < costUnits) {
+    return { status: 'INSUFFICIENT_CREDITS' };
+  }
+
+  if (!localCreditBalances.has(creditKey) && localCreditBalances.size >= MAX_LOCAL_NONCES) {
+    const oldest = localCreditBalances.keys().next().value;
+    if (oldest !== undefined) localCreditBalances.delete(oldest);
+  }
+
+  const rem = startingUnits - costUnits;
+  localCreditBalances.set(creditKey, rem);
+
+  if (kv && typeof kv.put === 'function') {
+    try {
+      await kv.put(`alpha402:credits:${creditKey}`, String(rem), { expirationTtl: ttlSeconds });
+    } catch (e) {
+      console.error('Cloudflare KV credit init error:', e);
+    }
+  }
+
+  return { status: 'CLAIMED', remainingUnits: rem };
 }
 
 /**
- * Atomic Distributed Nonce Settlement via Upstash Redis REST POST (for single-use L402 & EIP-3009 proofs)
+ * Atomic Distributed Nonce Settlement via Upstash Redis or Cloudflare KV (for single-use L402 & EIP-3009 proofs)
  */
 async function atomicClaimNonce(
   nonceKey: string,
   ttlSeconds: number,
   env: Record<string, any>,
-  sandboxActive: boolean
+  _sandboxActive: boolean
 ): Promise<'CLAIMED' | 'ALREADY_SPENT' | 'STORE_ERROR'> {
   if (!nonceKey || nonceKey.length > 200 || !/^[a-zA-Z0-9:_-]+$/.test(nonceKey)) {
     return 'STORE_ERROR';
@@ -295,25 +340,36 @@ async function atomicClaimNonce(
     return res.result === 'OK' ? 'CLAIMED' : 'ALREADY_SPENT';
   }
 
-  if (sandboxActive) {
-    if (localSpentTokens.has(nonceKey)) {
-      return 'ALREADY_SPENT';
-    }
-    if (localSpentTokens.size >= MAX_LOCAL_NONCES) {
-      const oldest = localSpentTokens.values().next().value;
-      if (oldest !== undefined) localSpentTokens.delete(oldest);
-    }
-    localSpentTokens.add(nonceKey);
-    return 'CLAIMED';
+  if (localSpentTokens.has(nonceKey)) {
+    return 'ALREADY_SPENT';
   }
 
-  console.error('FATAL: UPSTASH_REDIS_REST_URL not configured in production. Failing closed.');
-  return 'STORE_ERROR';
+  const kv = env.ALPHA402_KV;
+  if (kv && typeof kv.get === 'function') {
+    try {
+      const existing = await kv.get(`alpha402:nonce:${nonceKey}`);
+      if (existing !== null) {
+        localSpentTokens.add(nonceKey);
+        return 'ALREADY_SPENT';
+      }
+      await kv.put(`alpha402:nonce:${nonceKey}`, '1', { expirationTtl: ttlSeconds });
+    } catch (e) {
+      console.error('Cloudflare KV nonce claim error:', e);
+    }
+  }
+
+  if (localSpentTokens.size >= MAX_LOCAL_NONCES) {
+    const oldest = localSpentTokens.values().next().value;
+    if (oldest !== undefined) localSpentTokens.delete(oldest);
+  }
+  localSpentTokens.add(nonceKey);
+  return 'CLAIMED';
 }
 
 /**
  * Rollback Nonce or Refund Prepaid Credits on Provider Failure
- * - For prepaid x402 credits (`x402:...`): atomically refunds `paymentCostUnits` via INCRBY
+ * - For prepaid x402 credits (`x402:...`): atomically refunds `paymentCostUnits` via INCRBY / KV
+ * - For free trial (`trial:...`): decrements daily trial usage so failed upstream calls never waste free quota
  * - For single-use L402 / EIP-3009 nonces: atomically deletes the nonce via DEL
  */
 export async function releaseNonce(c: Context): Promise<boolean> {
@@ -324,6 +380,25 @@ export async function releaseNonce(c: Context): Promise<boolean> {
   const env = getEnv(c);
   const upstashUrl = env.UPSTASH_REDIS_REST_URL;
   const upstashToken = env.UPSTASH_REDIS_REST_TOKEN;
+  const kv = env.ALPHA402_KV;
+
+  if (paymentProof.startsWith('trial:')) {
+    const used = localFreeTrialCounts.get(paymentProof) || 0;
+    if (used > 0) {
+      const nextUsed = used - 1;
+      localFreeTrialCounts.set(paymentProof, nextUsed);
+      if (kv && typeof kv.put === 'function') {
+        try {
+          await kv.put(`alpha402:${paymentProof}`, String(nextUsed), { expirationTtl: 86400 });
+        } catch {
+          // Ignore KV refund error
+        }
+      }
+      const limit = Number(c.get('freeTrialLimit') || 3);
+      c.set('freeTrialRemaining', Math.max(0, limit - nextUsed));
+    }
+    return true;
+  }
 
   const isPrepaidCredit = paymentProof.startsWith('x402:') && costUnits > 0;
 
@@ -352,20 +427,199 @@ export async function releaseNonce(c: Context): Promise<boolean> {
     return res.ok && typeof res.result === 'number' && res.result > 0;
   }
 
-  if (env.ENABLE_SANDBOX === 'true') {
-    if (isPrepaidCredit) {
-      if (!localCreditBalances.has(paymentProof)) return false;
-      const newBal = localCreditBalances.get(paymentProof)! + costUnits;
-      localCreditBalances.set(paymentProof, newBal);
-      c.set('creditsRemainingUnits', newBal);
-      c.set('creditsRemainingUsdc', Number((newBal / 1_000_000).toFixed(6)));
-      c.set('callsRemaining', Math.floor(newBal / costUnits));
-      return true;
+  if (isPrepaidCredit) {
+    let currentBal = localCreditBalances.has(paymentProof)
+      ? localCreditBalances.get(paymentProof)!
+      : null;
+    if (currentBal === null && kv && typeof kv.get === 'function') {
+      try {
+        const kvVal = await kv.get(`alpha402:credits:${paymentProof}`);
+        if (kvVal !== null) currentBal = Number(kvVal);
+      } catch {
+        // Ignore
+      }
     }
-    return localSpentTokens.delete(paymentProof);
+    if (currentBal === null || !Number.isFinite(currentBal)) return false;
+    const newBal = currentBal + costUnits;
+    localCreditBalances.set(paymentProof, newBal);
+    if (kv && typeof kv.put === 'function') {
+      try {
+        await kv.put(`alpha402:credits:${paymentProof}`, String(newBal), {
+          expirationTtl: NONCE_TTL_SECONDS,
+        });
+      } catch {
+        // Ignore
+      }
+    }
+    c.set('creditsRemainingUnits', newBal);
+    c.set('creditsRemainingUsdc', Number((newBal / 1_000_000).toFixed(6)));
+    c.set('callsRemaining', Math.floor(newBal / costUnits));
+    return true;
   }
 
-  return false;
+  localSpentTokens.delete(paymentProof);
+  if (kv && typeof kv.delete === 'function') {
+    try {
+      await kv.delete(`alpha402:nonce:${paymentProof}`);
+    } catch {
+      // Ignore
+    }
+  }
+  return true;
+}
+
+/**
+ * Check remaining prepaid credit balance (or inspect an on-chain Base USDC deposit without spending)
+ */
+export async function inspectPrepaidCreditBalance(
+  rawTxHash: string,
+  c: Context
+): Promise<{
+  validFormat: boolean;
+  indexed: boolean;
+  onChainVerified: boolean;
+  creditsRemainingUsdc: number;
+  securityCallsRemaining: number;
+  alphaCallsRemaining: number;
+  polymarketCallsRemaining: number;
+  message: string;
+}> {
+  const cleanHash = rawTxHash.replace(/^x402\s+/i, '').trim().toLowerCase();
+  if (!/^0x[a-f0-9]{64}$/.test(cleanHash)) {
+    return {
+      validFormat: false,
+      indexed: false,
+      onChainVerified: false,
+      creditsRemainingUsdc: 0,
+      securityCallsRemaining: 0,
+      alphaCallsRemaining: 0,
+      polymarketCallsRemaining: 0,
+      message: 'Invalid Base transaction hash format. Expected a 66-character 0x... hex hash.',
+    };
+  }
+
+  const env = getEnv(c);
+  const creditKey = `x402:${cleanHash}`;
+  let units: number | null = localCreditBalances.has(creditKey)
+    ? localCreditBalances.get(creditKey)!
+    : null;
+
+  if (units === null && env.ALPHA402_KV && typeof env.ALPHA402_KV.get === 'function') {
+    try {
+      const val = await env.ALPHA402_KV.get(`alpha402:credits:${creditKey}`);
+      if (val !== null && Number.isFinite(Number(val))) {
+        units = Number(val);
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  if (units !== null) {
+    const usdc = Number((units / 1_000_000).toFixed(6));
+    return {
+      validFormat: true,
+      indexed: true,
+      onChainVerified: true,
+      creditsRemainingUsdc: usdc,
+      securityCallsRemaining: Math.floor(units / 5_000),
+      alphaCallsRemaining: Math.floor(units / 20_000),
+      polymarketCallsRemaining: Math.floor(units / 10_000),
+      message: `Active prepaid session found with $${usdc} USDC remaining.`,
+    };
+  }
+
+  const recipientAddress = env.BASE_RECIPIENT_ADDRESS || DEFAULT_CONFIG.baseRecipientAddress;
+  const rpcUrl = env.BASE_RPC_URL || DEFAULT_BASE_RPC_URL;
+  const verification = await verifyBaseUsdcReceipt(cleanHash, recipientAddress, 5_000n, rpcUrl);
+
+  if (!verification.verified || verification.totalUnits === undefined) {
+    return {
+      validFormat: true,
+      indexed: false,
+      onChainVerified: false,
+      creditsRemainingUsdc: 0,
+      securityCallsRemaining: 0,
+      alphaCallsRemaining: 0,
+      polymarketCallsRemaining: 0,
+      message: verification.reason || 'Transaction could not be verified on Base.',
+    };
+  }
+
+  const totalUnits = Number(
+    verification.totalUnits > 10_000_000_000n ? 10_000_000_000n : verification.totalUnits
+  );
+  const usdc = Number((totalUnits / 1_000_000).toFixed(6));
+  return {
+    validFormat: true,
+    indexed: false,
+    onChainVerified: true,
+    creditsRemainingUsdc: usdc,
+    securityCallsRemaining: Math.floor(totalUnits / 5_000),
+    alphaCallsRemaining: Math.floor(totalUnits / 20_000),
+    polymarketCallsRemaining: Math.floor(totalUnits / 10_000),
+    message: `Verified unspent on-chain deposit of $${usdc} USDC on Base! Pass paymentProof: "${cleanHash}" on any tool call to activate.`,
+  };
+}
+
+/**
+ * 3-Call Daily Free Trial for MCP Users & ?demo=true Evaluators
+ */
+async function tryConsumeFreeTrial(
+  c: Context,
+  env: Record<string, any>
+): Promise<{ allowed: boolean; remaining: number; limit: number; trialKey: string }> {
+  const limit = Math.max(0, Number(env.FREE_TRIAL_DAILY_LIMIT ?? 3));
+  if (limit <= 0) {
+    return { allowed: false, remaining: 0, limit: 0, trialKey: '' };
+  }
+
+  const dayKey = new Date().toISOString().slice(0, 10);
+  const clientIp =
+    c.req.header('CF-Connecting-IP') ||
+    c.req.header('X-Forwarded-For')?.split(',')[0]?.trim() ||
+    c.req.header('X-MCP-Client-ID') ||
+    'default_mcp_client';
+  const cleanClient = clientIp.replace(/[^a-zA-Z0-9._:-]/g, '_').slice(0, 64);
+  const trialKey = `trial:${dayKey}:${cleanClient}`;
+
+  let used: number | null = localFreeTrialCounts.has(trialKey)
+    ? localFreeTrialCounts.get(trialKey)!
+    : null;
+
+  const kv = env.ALPHA402_KV;
+  if (used === null && kv && typeof kv.get === 'function') {
+    try {
+      const kvVal = await kv.get(`alpha402:${trialKey}`);
+      if (kvVal !== null && Number.isFinite(Number(kvVal))) {
+        used = Number(kvVal);
+      }
+    } catch {
+      // Ignore KV read error
+    }
+  }
+
+  const currentUsed = used ?? 0;
+  if (currentUsed >= limit) {
+    return { allowed: false, remaining: 0, limit, trialKey };
+  }
+
+  const nextUsed = currentUsed + 1;
+  localFreeTrialCounts.set(trialKey, nextUsed);
+  if (kv && typeof kv.put === 'function') {
+    try {
+      await kv.put(`alpha402:${trialKey}`, String(nextUsed), { expirationTtl: 86400 });
+    } catch {
+      // Ignore KV write error
+    }
+  }
+
+  return {
+    allowed: true,
+    remaining: Math.max(0, limit - nextUsed),
+    limit,
+    trialKey,
+  };
 }
 
 /**
@@ -507,114 +761,139 @@ async function verifyAndSettleCoinbaseX402(
 }
 
 /**
- * On-Chain Base RPC Receipt Verification
+ * On-Chain Base RPC Receipt Verification (with automatic multi-RPC failover against HTTP 429)
  */
 async function verifyBaseUsdcReceipt(
   txHash: string,
   expectedRecipient: string,
   minUnits: bigint,
-  rpcUrl: string
+  primaryRpcUrl: string
 ): Promise<{ verified: boolean; totalUnits?: bigint; reason?: string }> {
   if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
     return { verified: false, reason: 'Invalid transaction hash format' };
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
+  const rpcCandidates = Array.from(new Set([primaryRpcUrl, ...FALLBACK_BASE_RPC_URLS]));
+  let lastErrorReason = 'Unable to reach Base RPC endpoints';
 
-  try {
-    const [receiptRes, blockRes] = await Promise.all([
-      fetch(rpcUrl, {
+  for (const rpcUrl of rpcCandidates) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4500);
+
+    try {
+      const receiptRes = await fetch(rpcUrl, {
         method: 'POST',
         signal: controller.signal,
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (compatible; Alpha402/1.6)',
+        },
         body: JSON.stringify({
           jsonrpc: '2.0',
           id: 1,
           method: 'eth_getTransactionReceipt',
           params: [txHash],
         }),
-      }),
-      fetch(rpcUrl, {
+      });
+
+      if (!receiptRes.ok) {
+        lastErrorReason = `Base RPC returned HTTP ${receiptRes.status}`;
+        continue;
+      }
+
+      const receiptJson: any = await receiptRes.json();
+      if (receiptJson?.error) {
+        lastErrorReason = receiptJson?.error?.message || 'RPC JSON-RPC error';
+        continue;
+      }
+
+      const receipt = receiptJson?.result;
+
+      if (!receipt) {
+        return { verified: false, reason: 'Transaction not found or not yet mined on Base' };
+      }
+
+      if (receipt.status !== '0x1') {
+        return { verified: false, reason: 'Transaction reverted on-chain' };
+      }
+
+      const blockRes = await fetch(rpcUrl, {
         method: 'POST',
         signal: controller.signal,
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (compatible; Alpha402/1.6)',
+        },
         body: JSON.stringify({
           jsonrpc: '2.0',
           id: 2,
           method: 'eth_blockNumber',
           params: [],
         }),
-      }),
-    ]);
+      });
 
-    if (!receiptRes.ok || !blockRes.ok) {
-      return { verified: false, reason: `Base RPC returned HTTP ${receiptRes.status}/${blockRes.status}` };
-    }
-
-    const [{ result: receipt }, { result: latestBlockHex }] = (await Promise.all([
-      receiptRes.json(),
-      blockRes.json(),
-    ])) as any[];
-
-    if (!receipt) {
-      return { verified: false, reason: 'Transaction not found or not yet mined on Base' };
-    }
-
-    if (receipt.status !== '0x1') {
-      return { verified: false, reason: 'Transaction reverted on-chain' };
-    }
-
-    if (
-      typeof receipt.blockNumber === 'string' &&
-      /^0x[a-fA-F0-9]+$/.test(receipt.blockNumber) &&
-      typeof latestBlockHex === 'string' &&
-      /^0x[a-fA-F0-9]+$/.test(latestBlockHex)
-    ) {
-      const txBlock = BigInt(receipt.blockNumber);
-      const currentBlock = BigInt(latestBlockHex);
-      if (currentBlock > txBlock && currentBlock - txBlock > MAX_TX_AGE_BLOCKS) {
-        return {
-          verified: false,
-          reason: 'Transaction receipt has expired (older than 24 hours / 43,200 blocks)',
-        };
+      if (!blockRes.ok) {
+        lastErrorReason = `Base RPC blockNumber returned HTTP ${blockRes.status}`;
+        continue;
       }
-    } else {
-      return { verified: false, reason: 'Unable to verify transaction block age from RPC' };
-    }
 
-    const cleanRecipient = expectedRecipient.toLowerCase().replace(/^0x/, '');
-    const paddedRecipient = '0x' + cleanRecipient.padStart(64, '0').toLowerCase();
+      const blockJson: any = await blockRes.json();
+      const latestBlockHex = blockJson?.result;
 
-    let totalTransferredUnits = 0n;
+      if (
+        typeof receipt.blockNumber === 'string' &&
+        /^0x[a-fA-F0-9]+$/.test(receipt.blockNumber) &&
+        typeof latestBlockHex === 'string' &&
+        /^0x[a-fA-F0-9]+$/.test(latestBlockHex)
+      ) {
+        const txBlock = BigInt(receipt.blockNumber);
+        const currentBlock = BigInt(latestBlockHex);
+        if (currentBlock > txBlock && currentBlock - txBlock > MAX_TX_AGE_BLOCKS) {
+          return {
+            verified: false,
+            reason: 'Transaction receipt has expired (older than 24 hours / 43,200 blocks)',
+          };
+        }
+      } else {
+        lastErrorReason = 'Unable to verify transaction block age from RPC';
+        continue;
+      }
 
-    for (const log of receipt.logs || []) {
-      if (log?.address?.toLowerCase() === BASE_USDC_CONTRACT) {
-        const topics = Array.isArray(log.topics) ? log.topics : [];
-        if (
-          topics[0]?.toLowerCase() === ERC20_TRANSFER_TOPIC &&
-          topics[2]?.toLowerCase() === paddedRecipient &&
-          typeof log.data === 'string' &&
-          /^0x[a-fA-F0-9]+$/.test(log.data)
-        ) {
-          totalTransferredUnits += BigInt(log.data);
+      const cleanRecipient = expectedRecipient.toLowerCase().replace(/^0x/, '');
+      const paddedRecipient = '0x' + cleanRecipient.padStart(64, '0').toLowerCase();
+
+      let totalTransferredUnits = 0n;
+
+      for (const log of receipt.logs || []) {
+        if (log?.address?.toLowerCase() === BASE_USDC_CONTRACT) {
+          const topics = Array.isArray(log.topics) ? log.topics : [];
+          if (
+            topics[0]?.toLowerCase() === ERC20_TRANSFER_TOPIC &&
+            topics[2]?.toLowerCase() === paddedRecipient &&
+            typeof log.data === 'string' &&
+            /^0x[a-fA-F0-9]+$/.test(log.data)
+          ) {
+            totalTransferredUnits += BigInt(log.data);
+          }
         }
       }
-    }
 
-    if (totalTransferredUnits < minUnits) {
-      return {
-        verified: false,
-        reason: `No matching USDC transfer >= ${minUnits} units found to ${expectedRecipient}`,
-      };
-    }
+      if (totalTransferredUnits < minUnits) {
+        return {
+          verified: false,
+          reason: `No matching USDC transfer >= ${minUnits} units found to ${expectedRecipient}`,
+        };
+      }
 
-    return { verified: true, totalUnits: totalTransferredUnits };
-  } catch (err: any) {
-    return { verified: false, reason: `RPC verification failed: ${err?.message || 'Unknown RPC error'}` };
-  } finally {
-    clearTimeout(timeout);
+      return { verified: true, totalUnits: totalTransferredUnits };
+    } catch (err: any) {
+      lastErrorReason = `RPC verification failed: ${err?.message || 'Unknown RPC error'}`;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+
+  return { verified: false, reason: lastErrorReason };
 }
 
 /**
@@ -707,8 +986,21 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
       return await next();
     }
 
-    const xPaymentHeader = c.req.header('X-PAYMENT') || c.req.header('x-payment');
+    let xPaymentHeader =
+      c.req.header('X-PAYMENT') ||
+      c.req.header('x-payment') ||
+      c.req.header('X-Payment-Proof') ||
+      c.req.query('paymentProof') ||
+      undefined;
     let authHeader = c.req.header('Authorization');
+
+    if (xPaymentHeader && !authHeader) {
+      const trimmedProof = xPaymentHeader.trim();
+      if (trimmedProof.startsWith('x402 ') || trimmedProof.startsWith('L402 ')) {
+        authHeader = trimmedProof;
+        xPaymentHeader = undefined;
+      }
+    }
 
     // 2. Official Coinbase x402 `X-PAYMENT` Header Support (`x402-fetch`, `x402-axios`, CDP AgentKit)
     if (xPaymentHeader && !authHeader) {
@@ -1043,7 +1335,36 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
       );
     }
 
+    // 3.5. Automatic 3-Call Daily Free Trial for MCP Clients & ?demo=true Evaluators
+    const wantsFreeTrial =
+      c.req.query('demo') === 'true' ||
+      c.req.header('X-MCP-Trial') === 'true' ||
+      c.req.header('x-mcp-trial') === 'true';
+
+    if (wantsFreeTrial) {
+      const trial = await tryConsumeFreeTrial(c, env);
+      if (trial.allowed) {
+        c.set('paymentType', 'free_trial_3_daily');
+        c.set('paymentProof', trial.trialKey);
+        c.set('paymentCostUnits', 0);
+        c.set('freeTrialRemaining', trial.remaining);
+        c.set('freeTrialLimit', trial.limit);
+        c.header('X-402-Free-Trial-Remaining', String(trial.remaining));
+        c.header('X-402-Upgrade-Recipient', recipientAddress);
+        await next();
+        return;
+      }
+    }
+
     // 4. No valid payment presented -> Issue HTTP 402 challenge (Compatible with Coinbase x402 v1, Prepaid x402, and L402)
+    await recordAnalyticsEvent(
+      {
+        endpoint: new URL(c.req.url).pathname,
+        outcome: 'PAYWALL_402',
+      },
+      env.ALPHA402_KV
+    );
+
     const randomBytes = new Uint8Array(32);
     crypto.getRandomValues(randomBytes);
     const challengeHash = Array.from(randomBytes)

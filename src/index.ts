@@ -1,12 +1,18 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { streamSSE } from 'hono/streaming';
-import { paywall402, releaseNonce } from './middleware/paywall402.js';
+import {
+  paywall402,
+  releaseNonce,
+  inspectPrepaidCreditBalance,
+  DEFAULT_CONFIG,
+} from './middleware/paywall402.js';
 import { fetchDexData } from './services/dexscreener.js';
 import { fetchSecurityReport } from './services/goplus.js';
 import { fetchPolymarketAlpha } from './services/polymarket.js';
 import { fetchNewPairsAlpha } from './services/newPairs.js';
 import { computeAlphaSignal } from './services/alphaEngine.js';
+import { recordAnalyticsEvent, getAnalyticsSnapshot } from './services/analytics.js';
 import {
   Network,
   AppBindings,
@@ -30,19 +36,35 @@ function getCreditTelemetry(c: any) {
       callsRemaining: typeof callsRemaining === 'number' ? callsRemaining : 0,
     };
   }
+  const freeTrialRemaining = c.get('freeTrialRemaining');
+  if (typeof freeTrialRemaining === 'number') {
+    return {
+      freeTrialCallsRemainingToday: freeTrialRemaining,
+      upgradeToUnlimited: {
+        message: `You have ${freeTrialRemaining} free daily trial call(s) remaining today. Deposit $1.00 USDC once on Base for 200 security audits or 50 full alpha calls with zero RPC latency.`,
+        network: 'base',
+        usdcContract: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+        recipientAddress: DEFAULT_CONFIG.baseRecipientAddress,
+        howToUse: 'Pass your Base USDC transfer tx hash as paymentProof: "0x<your_tx_hash>" or set ALPHA402_TX_HASH in your MCP config.',
+      },
+    };
+  }
   return {};
 }
 
 // 1. Root & Health Check (Free)
-app.get('/', (c) => {
+app.get('/', async (c) => {
+  await recordAnalyticsEvent({ endpoint: '/', outcome: 'DISCOVERY' }, c.env?.ALPHA402_KV);
   return c.json({
-    name: 'Alpha402 - Agent On-Chain Alpha API',
-    version: '1.5.0',
+    name: 'Alpha402 - DexScreener, GoPlus Token Security & Polymarket Alpha API + MCP',
+    version: '1.6.0',
     description:
-      'Cryptographically and RPC-verified, fail-closed on-chain alpha engine for autonomous AI agents. Supports Coinbase x402, Instant Multi-Call Prepaid Base USDC Sessions, and L402 Lightning.',
-    paymentProtocol: 'HTTP 402 (Coinbase x402 / Base USDC Prepaid & Single-Call / L402 Lightning HMAC + SHA-256)',
+      'Real-time DEX token momentum, GoPlus anti-honeypot contract security audits, newly active safe pool discovery, and Polymarket arbitrage signals for AI agents. Includes 3 free daily MCP queries + instant prepaid Base USDC sessions & Coinbase x402.',
+    paymentProtocol: 'HTTP 402 (3 Free Daily MCP Queries + Coinbase x402 + Base USDC Prepaid & Single-Call + L402 Lightning)',
     endpoints: {
       mcp: '/mcp',
+      analytics: '/v1/analytics',
+      credits: '/v1/credits?txHash=0x...',
       tokenSecurity: '/v1/token-security?network=base&address=0x...',
       tokenAlpha: '/v1/token-alpha?network=base&address=0x...',
       newPairs: '/v1/new-pairs?network=base&limit=5',
@@ -51,9 +73,10 @@ app.get('/', (c) => {
       manifest: '/.well-known/agent.json',
       openapi: '/openapi.json',
     },
-    prepaidSessions: {
-      description:
-        'Send any amount >= endpoint cost in a single Base USDC transfer (e.g. $1.00 = 50 alpha calls or 200 security audits) and reuse the same Authorization: x402 <tx_hash> with sub-20ms Redis deduction and zero Base RPC latency.',
+    freeTrialAndPrepaid: {
+      freeTrial: '3 free queries per day automatically enabled on MCP tools and via ?demo=true.',
+      prepaidBaseUsdc:
+        'Send any amount >= $0.005 USDC on Base to 0x8a8c238ed2b46908Ff6C6922a3870984f20f8913 (e.g. $1.00 = 50 alpha calls or 200 security audits) and reuse the same Authorization: x402 <tx_hash>.',
     },
     scoringFormula: {
       formula: 'AlphaScore = (Security * 0.40) + (Momentum * 0.35) + (Liquidity * 0.25)',
@@ -67,22 +90,69 @@ app.get('/', (c) => {
   });
 });
 
+// 1.5. Real-Time Funnel & Revenue Analytics Endpoint (Free)
+app.get('/v1/analytics', async (c) => {
+  const snapshot = await getAnalyticsSnapshot(c.env?.ALPHA402_KV);
+  return c.json({
+    service: 'Alpha402 Analytics & Conversion Funnel',
+    recipientWalletBaseUsdc: DEFAULT_CONFIG.baseRecipientAddress,
+    ...snapshot,
+  });
+});
+
+// 1.6. Free Credit Balance & Deposit Inspector (Free)
+app.get('/v1/credits', async (c) => {
+  const txHash = c.req.query('txHash') || c.req.header('X-Payment-Proof') || '';
+  const recipient = c.env?.BASE_RECIPIENT_ADDRESS || DEFAULT_CONFIG.baseRecipientAddress;
+
+  if (!txHash) {
+    return c.json({
+      freeTrialPolicy: '3 free MCP tool calls per day included automatically (or pass ?demo=true on REST endpoints).',
+      depositInstructions: {
+        network: 'base (Chain ID 8453)',
+        token: 'USDC (0x833589fcd6edb6e08f4c7c32d4f71b54bda02913)',
+        recipientWallet: recipient,
+        tiers: {
+          '$0.005 USDC': '1 check_token_security call',
+          '$0.01 USDC': '1 get_polymarket_alpha call',
+          '$0.02 USDC': '1 get_token_alpha or get_new_pairs_alpha call',
+          '$1.00 USDC (Recommended)': '200 security audits OR 50 full token/new-pair alpha calls on a single tx_hash',
+          '$5.00 USDC (Pro Bot)': '1,000 security audits OR 250 full token/new-pair alpha calls on a single tx_hash',
+        },
+        howToRedeem: 'Pass paymentProof: "0x<your_base_tx_hash>" in any MCP tool call or set ALPHA402_TX_HASH in your MCP env config.',
+      },
+    });
+  }
+
+  const status = await inspectPrepaidCreditBalance(txHash, c);
+  return c.json({
+    txHash,
+    recipientWallet: recipient,
+    ...status,
+  });
+});
+
 // 2. Machine-Readable Agent Discovery Manifest (Free)
-app.get('/.well-known/agent.json', (c) => {
+app.get('/.well-known/agent.json', async (c) => {
+  await recordAnalyticsEvent(
+    { endpoint: '/.well-known/agent.json', outcome: 'DISCOVERY' },
+    c.env?.ALPHA402_KV
+  );
   return c.json({
     schema_version: 'v1',
     name_for_model: 'alpha402_onchain_intelligence',
-    name_for_human: 'Alpha402 On-Chain Alpha',
+    name_for_human: 'Alpha402 On-Chain Alpha & Honeypot Security Auditor',
     description_for_model:
-      'Provides fail-closed token momentum, liquidity depth, anti-honeypot contract security audits, newly active safe token pair feeds, and Polymarket spreads for autonomous trading agents. Supports Coinbase x402 (X-PAYMENT), multi-call prepaid Base USDC credits (Authorization: x402 <tx_hash>), and L402.',
+      'Provides fail-closed token momentum, liquidity depth, GoPlus anti-honeypot contract security audits, newly active safe token pair feeds, and Polymarket spreads for autonomous trading agents. Includes 3 free daily calls + Coinbase x402 (X-PAYMENT), multi-call prepaid Base USDC credits (Authorization: x402 <tx_hash>), and L402.',
     auth: {
       type: 'http_402',
+      free_trial_daily_calls: 3,
       protocols: ['coinbase-x402', 'x402-prepaid', 'L402'],
     },
     tools: [
       {
         name: 'checkTokenSecurity',
-        description: 'Fast fail-closed anti-honeypot and contract security audit ($0.005 USDC / 5 sats).',
+        description: 'Fast fail-closed anti-honeypot and contract security audit ($0.005 USDC / 5 sats, first 3 calls/day free).',
         parameters: {
           type: 'object',
           properties: {
@@ -95,7 +165,7 @@ app.get('/.well-known/agent.json', (c) => {
       {
         name: 'getTokenAlpha',
         description:
-          'Analyzes contract security (fails closed on audit errors with reusable credit), volume spikes, and liquidity for any token ($0.02 USDC / 20 sats).',
+          'Analyzes contract security (fails closed on audit errors with reusable credit), volume spikes, and liquidity for any token ($0.02 USDC / 20 sats, first 3 calls/day free).',
         parameters: {
           type: 'object',
           properties: {
@@ -108,7 +178,7 @@ app.get('/.well-known/agent.json', (c) => {
       {
         name: 'getNewPairsAlpha',
         description:
-          'Scans newly active and trending token pools on a chain, filters out honeypots via GoPlus, and returns top safe pairs ranked by AlphaScore ($0.02 USDC / 20 sats).',
+          'Scans newly active and trending token pools on a chain, filters out honeypots via GoPlus, and returns top safe pairs ranked by AlphaScore ($0.02 USDC / 20 sats, first 3 calls/day free).',
         parameters: {
           type: 'object',
           properties: {
@@ -119,111 +189,183 @@ app.get('/.well-known/agent.json', (c) => {
       },
       {
         name: 'getPolymarketAlpha',
-        description: 'Retrieves top volume prediction markets, outcomes, prices, and spreads on Polymarket ($0.01 USDC / 10 sats).',
+        description: 'Retrieves top volume prediction markets, outcomes, prices, and spreads on Polymarket ($0.01 USDC / 10 sats, first 3 calls/day free).',
         parameters: { type: 'object', properties: {} },
       },
     ],
   });
 });
 
-// 3. HTTP MCP Endpoint for Smithery, Cursor & Claude (Streamable & JSON-RPC)
+// 3. HTTP MCP Endpoint for Glama, Smithery, Cursor & Claude (TDQS-Optimized Tool Definitions)
 export const MCP_TOOLS = [
   {
     name: 'check_token_security',
+    title: 'Check Token Smart Contract Security & Honeypot Status',
     description:
-      'Fast fail-closed anti-honeypot and smart contract security audit (checks honeypots, high buy/sell tax, blacklist, freeze authority, balance modification). Micro-tier: $0.005 USDC / 5 sats.',
+      'Performs a fast, fail-closed smart contract security and anti-honeypot audit via GoPlus on Base, Solana, Ethereum, BSC, Arbitrum, or Polygon. Detects honeypots, buy/sell taxes (in % and basis points), balance modification backdoors, mint authority, and blacklists. Includes 3 free calls/day; unlimited calls cost $0.005 USDC via Base prepaid session.',
+    annotations: {
+      title: 'Check Token Security & Honeypot Audit',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     inputSchema: {
       type: 'object',
       properties: {
         network: {
           type: 'string',
           enum: [...SUPPORTED_NETWORKS],
-          description: 'Blockchain network (default is base)',
+          default: 'base',
+          description:
+            'Target blockchain network to audit: "base", "solana", "ethereum", "bsc", "arbitrum", or "polygon". Defaults to "base".',
         },
         address: {
           type: 'string',
-          description: 'The smart contract address or token mint address',
+          description:
+            'The token smart contract address (0x... for EVM chains like Base/Ethereum, or Base58 mint address for Solana). Example Base BRETT address: "0x532f27101965dd16442e59d40670faf5ebb142e4".',
         },
         paymentProof: {
           type: 'string',
           description:
-            'Optional HTTP 402 payment header value (e.g. "x402 0x<base_usdc_tx_hash>" or "L402 <token>:<preimage>" or base64 Coinbase X-PAYMENT). Deposit $1 USDC once for 200 instant calls.',
+            'Optional Base USDC transaction hash ("0x...") or HTTP 402 payment header for unlimited calls after your 3 free daily queries. Deposit $1.00 USDC once on Base to 0x8a8c238ed2b46908Ff6C6922a3870984f20f8913 for 200 instant security audits.',
         },
       },
       required: ['address'],
+      additionalProperties: false,
     },
   },
   {
     name: 'get_token_alpha',
+    title: 'Get Token Composite AlphaScore, Momentum & Security Analysis',
     description:
-      'Performs fail-closed real-time security audit (is_honeypot, sell taxes, balance modifications), volume momentum analysis, and liquidity depth scoring for any token. Supports Base, Solana, Ethereum, BSC, Arbitrum, Polygon ($0.02 USDC / 20 sats).',
+      'Computes a fail-closed composite AlphaScore (0-100) combining GoPlus smart contract security (40% weight), DexScreener 5m/1h volume momentum & buy-pressure ratio (35% weight), and USD liquidity depth (25% weight) with automatic wash-trading detection. Includes 3 free calls/day; unlimited calls cost $0.02 USDC.',
+    annotations: {
+      title: 'Get Token Composite AlphaScore & Market Signals',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     inputSchema: {
       type: 'object',
       properties: {
         network: {
           type: 'string',
           enum: [...SUPPORTED_NETWORKS],
-          description: 'Blockchain network (default is base)',
+          default: 'base',
+          description:
+            'Target blockchain network: "base", "solana", "ethereum", "bsc", "arbitrum", or "polygon". Defaults to "base".',
         },
         address: {
           type: 'string',
-          description: 'The smart contract address or token mint address',
+          description:
+            'The token smart contract address (0x... for EVM chains or Base58 mint address for Solana). Example Base token: "0x532f27101965dd16442e59d40670faf5ebb142e4".',
         },
         paymentProof: {
           type: 'string',
           description:
-            'Optional HTTP 402 payment header value (e.g. "x402 0x<base_usdc_tx_hash>" or "L402 <token>:<preimage>"). Deposit $1 USDC once for 50 instant calls.',
+            'Optional Base USDC transaction hash ("0x...") or HTTP 402 payment proof for unlimited calls after your 3 free daily queries. Deposit $1.00 USDC once on Base to 0x8a8c238ed2b46908Ff6C6922a3870984f20f8913 for 50 instant alpha calls.',
         },
       },
       required: ['address'],
+      additionalProperties: false,
     },
   },
   {
     name: 'get_new_pairs_alpha',
+    title: 'Discover Verified Safe New & Trending DEX Token Pairs',
     description:
-      'Discovers newly active and trending token pools on Base, Solana, Ethereum, BSC, Arbitrum, or Polygon, filters out honeypots via GoPlus fail-closed audits, and returns the top safe pairs ranked by AlphaScore ($0.02 USDC / 20 sats).',
+      'Scans newly active and boosted liquidity pools on Base, Solana, Ethereum, BSC, Arbitrum, or Polygon via DexScreener, automatically filters out honeypots and high-tax scams via GoPlus security audits, and returns the top verified safe pairs ranked by AlphaScore. Includes 3 free calls/day; unlimited calls cost $0.02 USDC.',
+    annotations: {
+      title: 'Discover Safe New DEX Token Pairs',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     inputSchema: {
       type: 'object',
       properties: {
         network: {
           type: 'string',
           enum: [...SUPPORTED_NETWORKS],
-          description: 'Blockchain network (default is base)',
+          default: 'base',
+          description:
+            'Blockchain network to scan for safe new token pools ("base", "solana", "ethereum", "bsc", "arbitrum", or "polygon"). Defaults to "base".',
         },
         limit: {
           type: 'number',
-          description: 'Max number of verified safe pairs to return (1-10, default 5)',
+          default: 5,
+          minimum: 1,
+          maximum: 10,
+          description: 'Maximum number of verified safe token pairs to return (between 1 and 10, defaults to 5).',
         },
         paymentProof: {
           type: 'string',
           description:
-            'Optional HTTP 402 payment header value (e.g. "x402 0x<base_usdc_tx_hash>" or "L402 <token>:<preimage>").',
+            'Optional Base USDC transaction hash ("0x...") or HTTP 402 payment proof for unlimited calls after your 3 free daily queries.',
         },
       },
+      additionalProperties: false,
     },
   },
   {
     name: 'get_polymarket_alpha',
+    title: 'Get Polymarket High-Volume Prediction Markets & Arbitrage Spreads',
     description:
-      'Retrieves top volume prediction markets, outcomes, prices, and arbitrage spreads from Polymarket ($0.01 USDC / 10 sats).',
+      'Retrieves the highest-volume active prediction markets on Polymarket along with outcome probabilities, liquidity depth in USD, and binary arbitrage spreads. Includes 3 free calls/day; unlimited calls cost $0.01 USDC.',
+    annotations: {
+      title: 'Get Polymarket Prediction Market Alpha & Spreads',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     inputSchema: {
       type: 'object',
       properties: {
         paymentProof: {
           type: 'string',
           description:
-            'Optional HTTP 402 payment header value (e.g. "x402 0x<base_usdc_tx_hash>" or "L402 <token>:<preimage>").',
+            'Optional Base USDC transaction hash ("0x...") or HTTP 402 payment proof for unlimited calls after your 3 free daily queries.',
         },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_credits_and_payment_info',
+    title: 'Check Prepaid USDC Credit Balance & Deposit Instructions (Free)',
+    description:
+      '100% free utility tool with zero cost. Checks the remaining prepaid USDC credit balance and remaining call count for any Base USDC transaction hash (0x...), or returns the Base USDC deposit address and pricing tiers for upgrading from the 3 free daily calls.',
+    annotations: {
+      title: 'Check Credit Balance & Payment Info (Free)',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        txHash: {
+          type: 'string',
+          description:
+            'Optional 66-character Base USDC transaction hash ("0x...") to verify on-chain and check remaining prepaid credit balance.',
+        },
+      },
+      additionalProperties: false,
     },
   },
 ];
 
-app.get('/mcp', (c) => {
+app.get('/mcp', async (c) => {
+  await recordAnalyticsEvent({ endpoint: '/mcp', outcome: 'DISCOVERY' }, c.env?.ALPHA402_KV);
   return c.json({
     status: 'ready',
     service: 'alpha402-mcp-server',
-    version: '1.5.0',
+    version: '1.6.0',
     capabilities: { tools: true },
     tools: MCP_TOOLS,
   });
@@ -244,6 +386,10 @@ app.post('/mcp', async (c) => {
   const { id, method, params } = body || {};
 
   if (method === 'initialize') {
+    await recordAnalyticsEvent(
+      { endpoint: '/mcp', tool: 'mcp:initialize', outcome: 'DISCOVERY' },
+      c.env?.ALPHA402_KV
+    );
     return c.json({
       jsonrpc: '2.0',
       id: id ?? null,
@@ -252,7 +398,7 @@ app.post('/mcp', async (c) => {
         capabilities: { tools: {} },
         serverInfo: {
           name: 'alpha402-intelligence-mcp',
-          version: '1.5.0',
+          version: '1.6.0',
         },
       },
     });
@@ -271,6 +417,10 @@ app.post('/mcp', async (c) => {
   }
 
   if (method === 'tools/list') {
+    await recordAnalyticsEvent(
+      { endpoint: '/mcp', tool: 'mcp:tools/list', outcome: 'DISCOVERY' },
+      c.env?.ALPHA402_KV
+    );
     return c.json({
       jsonrpc: '2.0',
       id: id ?? null,
@@ -283,9 +433,13 @@ app.post('/mcp', async (c) => {
     const args = params?.arguments || {};
 
     if (
-      !['check_token_security', 'get_token_alpha', 'get_new_pairs_alpha', 'get_polymarket_alpha'].includes(
-        toolName
-      )
+      ![
+        'check_token_security',
+        'get_token_alpha',
+        'get_new_pairs_alpha',
+        'get_polymarket_alpha',
+        'get_credits_and_payment_info',
+      ].includes(toolName)
     ) {
       return c.json({
         jsonrpc: '2.0',
@@ -294,7 +448,36 @@ app.post('/mcp', async (c) => {
       });
     }
 
-    // Validate tool arguments BEFORE charging payment proof
+    if (toolName === 'get_credits_and_payment_info') {
+      const txHash = typeof args.txHash === 'string' ? args.txHash.trim() : '';
+      const creditsUrl = txHash
+        ? `/v1/credits?txHash=${encodeURIComponent(txHash)}`
+        : '/v1/credits';
+      const subRes = await app.request(creditsUrl, { method: 'GET' }, c.env);
+      const subData = await subRes.json();
+      await recordAnalyticsEvent(
+        {
+          endpoint: '/mcp',
+          tool: 'get_credits_and_payment_info',
+          outcome: 'FREE_TRIAL',
+        },
+        c.env?.ALPHA402_KV
+      );
+      return c.json({
+        jsonrpc: '2.0',
+        id: id ?? null,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(subData, null, 2),
+            },
+          ],
+        },
+      });
+    }
+
+    // Validate tool arguments BEFORE charging payment proof or consuming free trial
     if (toolName === 'check_token_security' || toolName === 'get_token_alpha') {
       const rawNetwork = String(args.network || 'base').toLowerCase();
       const address = typeof args.address === 'string' ? args.address.trim() : '';
@@ -357,270 +540,61 @@ app.post('/mcp', async (c) => {
       }
     }
 
-    // Enforce HTTP 402 paywall on remote HTTP tool executions
-    const tierCosts =
-      toolName === 'check_token_security'
-        ? { costUsdc: 0.005, costSats: 5 }
-        : toolName === 'get_polymarket_alpha'
-          ? { costUsdc: 0.01, costSats: 10 }
-          : { costUsdc: 0.02, costSats: 20 };
+    // Build internal subrequest headers forwarding paymentProof and MCP free-trial eligibility
+    const subHeaders: Record<string, string> = {
+      Accept: 'application/json',
+      'X-MCP-Trial': 'true',
+    };
+    const clientIp = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For');
+    if (clientIp) subHeaders['X-Forwarded-For'] = clientIp;
 
-    let authorized = false;
-    const paywallResponse = await paywall402(tierCosts)(c, async () => {
-      authorized = true;
-    });
+    const existingAuth = c.req.header('Authorization');
+    const existingXPayment = c.req.header('X-PAYMENT') || c.req.header('x-payment');
+    if (existingAuth) subHeaders['Authorization'] = existingAuth;
+    if (existingXPayment) subHeaders['X-PAYMENT'] = existingXPayment;
 
-    if (!authorized && paywallResponse) {
-      return paywallResponse;
+    const argProof = typeof args.paymentProof === 'string' ? args.paymentProof.trim() : '';
+    if (argProof) {
+      if (argProof.startsWith('x402 ') || argProof.startsWith('L402 ')) {
+        subHeaders['Authorization'] = argProof;
+      } else if (/^0x[a-fA-F0-9]{64}$/.test(argProof) || /^TEST_TX_/.test(argProof)) {
+        subHeaders['Authorization'] = `x402 ${argProof}`;
+      } else {
+        subHeaders['X-PAYMENT'] = argProof;
+      }
     }
 
-    const isDemo = c.get('paymentType') === 'demo_sandbox';
-
+    let internalPath = '/v1/polymarket-alpha';
     if (toolName === 'check_token_security') {
+      const rawNetwork = String(args.network || 'base').toLowerCase();
       const address = String(args.address).trim();
-      const network = String(args.network || 'base').toLowerCase() as Network;
-      const securityReport = await fetchSecurityReport(network, address);
-
-      if (securityReport.auditStatus !== 'VERIFIED') {
-        const released = await releaseNonce(c);
-        return c.json({
-          jsonrpc: '2.0',
-          id: id ?? null,
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(
-                  {
-                    success: false,
-                    error: 'Security audit unavailable or timed out. Failing closed.',
-                    auditStatus: securityReport.auditStatus,
-                    reusableCredit: isDemo ? true : released,
-                    charged: isDemo ? false : !released,
-                    ...getCreditTelemetry(c),
-                    securityReport,
-                  },
-                  null,
-                  2
-                ),
-              },
-            ],
-            isError: true,
-          },
-        });
-      }
-
-      return c.json({
-        jsonrpc: '2.0',
-        id: id ?? null,
-        result: {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: true,
-                  charged: true,
-                  paymentVerifiedBy: c.get('paymentType'),
-                  ...getCreditTelemetry(c),
-                  securityAudit: securityReport,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        },
-      });
-    }
-
-    if (toolName === 'get_token_alpha') {
+      internalPath = `/v1/token-security?network=${encodeURIComponent(rawNetwork)}&address=${encodeURIComponent(address)}`;
+    } else if (toolName === 'get_token_alpha') {
+      const rawNetwork = String(args.network || 'base').toLowerCase();
       const address = String(args.address).trim();
-      const network = String(args.network || 'base').toLowerCase() as Network;
-
-      const [dexData, securityReport] = await Promise.all([
-        fetchDexData(address, network),
-        fetchSecurityReport(network, address),
-      ]);
-
-      if (!dexData) {
-        const released = await releaseNonce(c);
-        return c.json({
-          jsonrpc: '2.0',
-          id: id ?? null,
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  success: false,
-                  error: `No active liquidity pools found for ${address} on ${network}.`,
-                  reusableCredit: isDemo ? true : released,
-                  charged: isDemo ? false : !released,
-                  ...getCreditTelemetry(c),
-                }),
-              },
-            ],
-            isError: true,
-          },
-        });
-      }
-
-      if (securityReport.auditStatus !== 'VERIFIED') {
-        const released = await releaseNonce(c);
-        return c.json({
-          jsonrpc: '2.0',
-          id: id ?? null,
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(
-                  {
-                    success: false,
-                    error: 'Security audit unavailable or timed out. Failing closed.',
-                    auditStatus: securityReport.auditStatus,
-                    reusableCredit: isDemo ? true : released,
-                    charged: isDemo ? false : !released,
-                    ...getCreditTelemetry(c),
-                    data: null,
-                  },
-                  null,
-                  2
-                ),
-              },
-            ],
-            isError: true,
-          },
-        });
-      }
-
-      const alphaSignal = computeAlphaSignal(network, dexData, securityReport);
-      return c.json({
-        jsonrpc: '2.0',
-        id: id ?? null,
-        result: {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: true,
-                  charged: true,
-                  paymentVerifiedBy: c.get('paymentType'),
-                  ...getCreditTelemetry(c),
-                  data: alphaSignal,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        },
-      });
-    }
-
-    if (toolName === 'get_new_pairs_alpha') {
-      const network = String(args.network || 'base').toLowerCase() as Network;
+      internalPath = `/v1/token-alpha?network=${encodeURIComponent(rawNetwork)}&address=${encodeURIComponent(address)}`;
+    } else if (toolName === 'get_new_pairs_alpha') {
+      const rawNetwork = String(args.network || 'base').toLowerCase();
       const limit = Number(args.limit) || 5;
-      const feed = await fetchNewPairsAlpha(network, limit);
-
-      if (!feed || feed.pairs.length === 0) {
-        const released = await releaseNonce(c);
-        return c.json({
-          jsonrpc: '2.0',
-          id: id ?? null,
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  success: false,
-                  error: `No verified safe token pairs found on ${network} at this time. Failing closed.`,
-                  reusableCredit: isDemo ? true : released,
-                  charged: isDemo ? false : !released,
-                  ...getCreditTelemetry(c),
-                }),
-              },
-            ],
-            isError: true,
-          },
-        });
-      }
-
-      return c.json({
-        jsonrpc: '2.0',
-        id: id ?? null,
-        result: {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: true,
-                  charged: true,
-                  paymentVerifiedBy: c.get('paymentType'),
-                  ...getCreditTelemetry(c),
-                  ...feed,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        },
-      });
+      internalPath = `/v1/new-pairs?network=${encodeURIComponent(rawNetwork)}&limit=${encodeURIComponent(String(limit))}`;
     }
 
-    if (toolName === 'get_polymarket_alpha') {
-      const markets = await fetchPolymarketAlpha();
-      if (!markets) {
-        const released = await releaseNonce(c);
-        return c.json({
-          jsonrpc: '2.0',
-          id: id ?? null,
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  success: false,
-                  error: 'Polymarket upstream service unavailable or timed out.',
-                  reusableCredit: isDemo ? true : released,
-                  charged: isDemo ? false : !released,
-                  ...getCreditTelemetry(c),
-                }),
-              },
-            ],
-            isError: true,
-          },
-        });
-      }
+    const subRes = await app.request(internalPath, { method: 'GET', headers: subHeaders }, c.env);
+    const subData = await subRes.json();
 
-      return c.json({
-        jsonrpc: '2.0',
-        id: id ?? null,
-        result: {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: true,
-                  charged: true,
-                  paymentVerifiedBy: c.get('paymentType'),
-                  ...getCreditTelemetry(c),
-                  count: markets.length,
-                  opportunities: markets,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        },
-      });
-    }
+    return c.json({
+      jsonrpc: '2.0',
+      id: id ?? null,
+      result: {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(subData, null, 2),
+          },
+        ],
+        ...(subRes.status >= 500 ? { isError: true } : {}),
+      },
+    });
   }
 
   return c.json({
@@ -939,7 +913,8 @@ app.get('/openapi.json', (c) => {
 
 // 5. Fast Micro-Tier Token Security Audit ($0.005 USDC / 5 sats)
 app.get('/v1/token-security', paywall402({ costUsdc: 0.005, costSats: 5 }), async (c) => {
-  const isDemo = c.get('paymentType') === 'demo_sandbox';
+  const paymentType = c.get('paymentType');
+  const isFreeOrDemo = paymentType === 'demo_sandbox' || paymentType === 'free_trial_3_daily';
   const rawAddress = c.req.query('address');
   const rawNetwork = (c.req.query('network') || 'base').toLowerCase();
 
@@ -949,8 +924,8 @@ app.get('/v1/token-security', paywall402({ costUsdc: 0.005, costSats: 5 }), asyn
       {
         success: false,
         error: 'Invalid or missing token address or network parameter.',
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
         ...getCreditTelemetry(c),
       },
       400
@@ -964,13 +939,24 @@ app.get('/v1/token-security', paywall402({ costUsdc: 0.005, costSats: 5 }), asyn
 
   if (securityReport.auditStatus !== 'VERIFIED') {
     const released = await releaseNonce(c);
+    await recordAnalyticsEvent(
+      {
+        endpoint: '/v1/token-security',
+        tool: 'check_token_security',
+        network,
+        address,
+        outcome: 'REFUNDED_503',
+        paymentType,
+      },
+      c.env?.ALPHA402_KV
+    );
     return c.json(
       {
         success: false,
         error: 'Security audit unavailable or timed out. Failing closed.',
         auditStatus: securityReport.auditStatus,
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
         ...getCreditTelemetry(c),
         data: null,
       },
@@ -978,11 +964,24 @@ app.get('/v1/token-security', paywall402({ costUsdc: 0.005, costSats: 5 }), asyn
     );
   }
 
+  await recordAnalyticsEvent(
+    {
+      endpoint: '/v1/token-security',
+      tool: 'check_token_security',
+      network,
+      address,
+      outcome: isFreeOrDemo ? 'FREE_TRIAL' : 'PAID_VERIFIED',
+      paymentType,
+      revenueUsdc: isFreeOrDemo ? 0 : 0.005,
+    },
+    c.env?.ALPHA402_KV
+  );
+
   return c.json({
     success: true,
-    charged: true,
+    charged: !isFreeOrDemo,
     reusableCredit: false,
-    paymentVerifiedBy: c.get('paymentType'),
+    paymentVerifiedBy: paymentType,
     ...getCreditTelemetry(c),
     data: securityReport,
   });
@@ -990,7 +989,8 @@ app.get('/v1/token-security', paywall402({ costUsdc: 0.005, costSats: 5 }), asyn
 
 // 6. Token Alpha Analysis (Protected by 402 Paywall)
 app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (c) => {
-  const isDemo = c.get('paymentType') === 'demo_sandbox';
+  const paymentType = c.get('paymentType');
+  const isFreeOrDemo = paymentType === 'demo_sandbox' || paymentType === 'free_trial_3_daily';
   const rawAddress = c.req.query('address');
   const rawNetwork = (c.req.query('network') || 'base').toLowerCase();
 
@@ -1000,8 +1000,8 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
       {
         success: false,
         error: 'Missing required query parameter: address',
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
         ...getCreditTelemetry(c),
       },
       400
@@ -1014,8 +1014,8 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
       {
         success: false,
         error: `Unsupported network "${rawNetwork}". Supported networks: ${SUPPORTED_NETWORKS.join(', ')}`,
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
         ...getCreditTelemetry(c),
       },
       400
@@ -1031,8 +1031,8 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
       {
         success: false,
         error: `Invalid token contract address format for network "${network}".`,
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
         ...getCreditTelemetry(c),
       },
       400
@@ -1051,8 +1051,8 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
         {
           success: false,
           error: `No active liquidity pools found for address ${address} on network ${network}.`,
-          reusableCredit: isDemo ? true : released,
-          charged: isDemo ? false : !released,
+          reusableCredit: isFreeOrDemo ? true : released,
+          charged: isFreeOrDemo ? false : !released,
           ...getCreditTelemetry(c),
           suggestion: 'Verify the token contract address. Your payment proof remains valid and reusable.',
         },
@@ -1065,13 +1065,24 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
 
     if (!isAuditVerified) {
       const released = await releaseNonce(c);
+      await recordAnalyticsEvent(
+        {
+          endpoint: '/v1/token-alpha',
+          tool: 'get_token_alpha',
+          network,
+          address,
+          outcome: 'REFUNDED_503',
+          paymentType,
+        },
+        c.env?.ALPHA402_KV
+      );
       return c.json(
         {
           success: false,
           error: 'Security audit unavailable or timed out. Failing closed.',
           auditStatus: securityReport.auditStatus,
-          reusableCredit: isDemo ? true : released,
-          charged: isDemo ? false : !released,
+          reusableCredit: isFreeOrDemo ? true : released,
+          charged: isFreeOrDemo ? false : !released,
           ...getCreditTelemetry(c),
           message:
             'Upstream audit failed. Payment proof was NOT consumed and remains a reusable credit. Data withheld to prevent unverified trading.',
@@ -1083,11 +1094,24 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
 
     const alphaResult = computeAlphaSignal(network, dexData, securityReport);
 
+    await recordAnalyticsEvent(
+      {
+        endpoint: '/v1/token-alpha',
+        tool: 'get_token_alpha',
+        network,
+        address,
+        outcome: isFreeOrDemo ? 'FREE_TRIAL' : 'PAID_VERIFIED',
+        paymentType,
+        revenueUsdc: isFreeOrDemo ? 0 : 0.02,
+      },
+      c.env?.ALPHA402_KV
+    );
+
     return c.json({
       success: true,
-      charged: true,
+      charged: !isFreeOrDemo,
       reusableCredit: false,
-      paymentVerifiedBy: c.get('paymentType'),
+      paymentVerifiedBy: paymentType,
       ...getCreditTelemetry(c),
       data: alphaResult,
     });
@@ -1097,8 +1121,8 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
       {
         success: false,
         error: 'Internal error while computing token alpha. Failing closed.',
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
         ...getCreditTelemetry(c),
         data: null,
       },
@@ -1109,7 +1133,8 @@ app.get('/v1/token-alpha', paywall402({ costUsdc: 0.02, costSats: 20 }), async (
 
 // 7. Newly Active Safe Pairs Discovery Feed ($0.02 USDC / 20 sats)
 app.get('/v1/new-pairs', paywall402({ costUsdc: 0.02, costSats: 20 }), async (c) => {
-  const isDemo = c.get('paymentType') === 'demo_sandbox';
+  const paymentType = c.get('paymentType');
+  const isFreeOrDemo = paymentType === 'demo_sandbox' || paymentType === 'free_trial_3_daily';
   const rawNetwork = (c.req.query('network') || 'base').toLowerCase();
   const limit = Number(c.req.query('limit') || '5');
 
@@ -1119,8 +1144,8 @@ app.get('/v1/new-pairs', paywall402({ costUsdc: 0.02, costSats: 20 }), async (c)
       {
         success: false,
         error: `Unsupported network "${rawNetwork}". Supported networks: ${SUPPORTED_NETWORKS.join(', ')}`,
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
         ...getCreditTelemetry(c),
       },
       400
@@ -1130,12 +1155,22 @@ app.get('/v1/new-pairs', paywall402({ costUsdc: 0.02, costSats: 20 }), async (c)
   const feed = await fetchNewPairsAlpha(rawNetwork, limit);
   if (!feed || feed.pairs.length === 0) {
     const released = await releaseNonce(c);
+    await recordAnalyticsEvent(
+      {
+        endpoint: '/v1/new-pairs',
+        tool: 'get_new_pairs_alpha',
+        network: rawNetwork,
+        outcome: 'REFUNDED_503',
+        paymentType,
+      },
+      c.env?.ALPHA402_KV
+    );
     return c.json(
       {
         success: false,
         error: `No verified safe token pairs found on ${rawNetwork} at this time. Failing closed.`,
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
         ...getCreditTelemetry(c),
         data: null,
       },
@@ -1143,11 +1178,23 @@ app.get('/v1/new-pairs', paywall402({ costUsdc: 0.02, costSats: 20 }), async (c)
     );
   }
 
+  await recordAnalyticsEvent(
+    {
+      endpoint: '/v1/new-pairs',
+      tool: 'get_new_pairs_alpha',
+      network: rawNetwork,
+      outcome: isFreeOrDemo ? 'FREE_TRIAL' : 'PAID_VERIFIED',
+      paymentType,
+      revenueUsdc: isFreeOrDemo ? 0 : 0.02,
+    },
+    c.env?.ALPHA402_KV
+  );
+
   return c.json({
     success: true,
-    charged: true,
+    charged: !isFreeOrDemo,
     reusableCredit: false,
-    paymentVerifiedBy: c.get('paymentType'),
+    paymentVerifiedBy: paymentType,
     ...getCreditTelemetry(c),
     data: feed,
   });
@@ -1155,7 +1202,8 @@ app.get('/v1/new-pairs', paywall402({ costUsdc: 0.02, costSats: 20 }), async (c)
 
 // 8. Real-Time SSE Stream for Newly Active Safe Pairs ($0.02 USDC / 20 sats)
 app.get('/v1/new-pairs/stream', paywall402({ costUsdc: 0.02, costSats: 20 }), async (c) => {
-  const isDemo = c.get('paymentType') === 'demo_sandbox';
+  const paymentType = c.get('paymentType');
+  const isFreeOrDemo = paymentType === 'demo_sandbox' || paymentType === 'free_trial_3_daily';
   const rawNetwork = (c.req.query('network') || 'base').toLowerCase();
   const limit = Number(c.req.query('limit') || '5');
 
@@ -1165,8 +1213,8 @@ app.get('/v1/new-pairs/stream', paywall402({ costUsdc: 0.02, costSats: 20 }), as
       {
         success: false,
         error: `Unsupported network "${rawNetwork}". Supported networks: ${SUPPORTED_NETWORKS.join(', ')}`,
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
       },
       400
     );
@@ -1179,8 +1227,8 @@ app.get('/v1/new-pairs/stream', paywall402({ costUsdc: 0.02, costSats: 20 }), as
       {
         success: false,
         error: `No verified safe token pairs available to stream on ${rawNetwork}. Failing closed.`,
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
       },
       503
     );
@@ -1191,7 +1239,7 @@ app.get('/v1/new-pairs/stream', paywall402({ costUsdc: 0.02, costSats: 20 }), as
       event: 'snapshot',
       id: Date.now().toString(),
       data: JSON.stringify({
-        paymentVerifiedBy: c.get('paymentType'),
+        paymentVerifiedBy: paymentType,
         ...getCreditTelemetry(c),
         ...feed,
       }),
@@ -1209,17 +1257,27 @@ app.get('/v1/new-pairs/stream', paywall402({ costUsdc: 0.02, costSats: 20 }), as
 
 // 9. Polymarket Alpha Signals (Protected by 402 Paywall)
 app.get('/v1/polymarket-alpha', paywall402({ costUsdc: 0.01, costSats: 10 }), async (c) => {
-  const isDemo = c.get('paymentType') === 'demo_sandbox';
+  const paymentType = c.get('paymentType');
+  const isFreeOrDemo = paymentType === 'demo_sandbox' || paymentType === 'free_trial_3_daily';
   const opportunities = await fetchPolymarketAlpha();
 
   if (!opportunities) {
     const released = await releaseNonce(c);
+    await recordAnalyticsEvent(
+      {
+        endpoint: '/v1/polymarket-alpha',
+        tool: 'get_polymarket_alpha',
+        outcome: 'REFUNDED_503',
+        paymentType,
+      },
+      c.env?.ALPHA402_KV
+    );
     return c.json(
       {
         success: false,
         error: 'Polymarket upstream service unavailable or timed out. Failing closed.',
-        reusableCredit: isDemo ? true : released,
-        charged: isDemo ? false : !released,
+        reusableCredit: isFreeOrDemo ? true : released,
+        charged: isFreeOrDemo ? false : !released,
         ...getCreditTelemetry(c),
         opportunities: null,
       },
@@ -1227,11 +1285,22 @@ app.get('/v1/polymarket-alpha', paywall402({ costUsdc: 0.01, costSats: 10 }), as
     );
   }
 
+  await recordAnalyticsEvent(
+    {
+      endpoint: '/v1/polymarket-alpha',
+      tool: 'get_polymarket_alpha',
+      outcome: isFreeOrDemo ? 'FREE_TRIAL' : 'PAID_VERIFIED',
+      paymentType,
+      revenueUsdc: isFreeOrDemo ? 0 : 0.01,
+    },
+    c.env?.ALPHA402_KV
+  );
+
   return c.json({
     success: true,
-    charged: true,
+    charged: !isFreeOrDemo,
     reusableCredit: false,
-    paymentVerifiedBy: c.get('paymentType'),
+    paymentVerifiedBy: paymentType,
     ...getCreditTelemetry(c),
     count: opportunities.length,
     opportunities,

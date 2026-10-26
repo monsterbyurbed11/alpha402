@@ -1,7 +1,7 @@
 {
   "name": "alpha402-mcp",
-  "version": "1.5.0",
-  "description": "HTTP 402 Real-Time On-Chain Alpha, Anti-Honeypot Security Audits & New Pairs Feed for Autonomous AI Agents (Supports Coinbase x402, Multi-Call Prepaid Base USDC, and L402)",
+  "version": "1.6.0",
+  "description": "DexScreener Token Alpha, GoPlus Anti-Honeypot Smart Contract Security Audits, Safe New Pairs & Polymarket Arbitrage MCP Server for AI Agents (3 Free Daily Calls + Coinbase x402 & Prepaid Base USDC)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",

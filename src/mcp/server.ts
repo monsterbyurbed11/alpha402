@@ -15,8 +15,10 @@ import * as readline from 'readline';
 const REMOTE_GATEWAY_URL = (
   process.env.ALPHA402_API_URL ||
   process.env.API_BASE ||
-  'https://alpha402.monsterbyurbed11.workers.dev'
+  'https://alpha402.acter.workers.dev'
 ).replace(/\/$/, '');
+
+const SESSION_CLIENT_ID = `mcp_${process.pid}_${Date.now().toString(36)}`;
 
 // Session-cached payment proof so a $1.00 USDC prepaid deposit automatically powers subsequent MCP tool calls
 let cachedSessionPaymentProof: string =
@@ -30,6 +32,8 @@ function buildPaymentHeaders(rawProof?: string): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
     'Content-Type': 'application/json',
+    'X-MCP-Trial': 'true',
+    'X-MCP-Client-ID': SESSION_CLIENT_ID,
   };
 
   if (!proof) return headers;
@@ -117,7 +121,7 @@ rl.on('line', async (line) => {
           capabilities: { tools: {} },
           serverInfo: {
             name: 'alpha402-intelligence-mcp',
-            version: '1.5.0',
+            version: '1.6.0',
           },
         },
       });
@@ -150,6 +154,27 @@ rl.on('line', async (line) => {
       const toolName = params?.name;
       const args = params?.arguments || {};
       const paymentProof = typeof args.paymentProof === 'string' ? args.paymentProof : undefined;
+
+      if (toolName === 'get_credits_and_payment_info') {
+        const txHash = typeof args.txHash === 'string' ? args.txHash.trim() : '';
+        const endpointPath = txHash
+          ? `/v1/credits?txHash=${encodeURIComponent(txHash)}`
+          : '/v1/credits';
+        const { data } = await callPaywalledGateway(endpointPath, undefined);
+        sendResponse({
+          jsonrpc: '2.0',
+          id: id ?? null,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(data, null, 2),
+              },
+            ],
+          },
+        });
+        return;
+      }
 
       if (toolName === 'check_token_security' || toolName === 'get_token_alpha') {
         const rawNetwork = String(args.network || 'base').toLowerCase();
@@ -209,7 +234,7 @@ rl.on('line', async (line) => {
                 text: JSON.stringify(data, null, 2),
               },
             ],
-            ...(status >= 400 ? { isError: true } : {}),
+            ...(status >= 500 || status === 400 || status === 404 ? { isError: true } : {}),
           },
         });
         return;
@@ -250,7 +275,7 @@ rl.on('line', async (line) => {
                 text: JSON.stringify(data, null, 2),
               },
             ],
-            ...(status >= 400 ? { isError: true } : {}),
+            ...(status >= 500 || status === 400 || status === 404 ? { isError: true } : {}),
           },
         });
         return;
@@ -268,7 +293,7 @@ rl.on('line', async (line) => {
                 text: JSON.stringify(data, null, 2),
               },
             ],
-            ...(status >= 400 ? { isError: true } : {}),
+            ...(status >= 500 || status === 400 || status === 404 ? { isError: true } : {}),
           },
         });
         return;

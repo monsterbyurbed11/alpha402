@@ -22,8 +22,15 @@ export function isValidTokenAddress(network: Network, address: string): boolean 
   return /^0x[a-fA-F0-9]{40}$/.test(trimmed);
 }
 
+export interface KVNamespaceLike {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
 export interface AppBindings {
   ENABLE_SANDBOX?: string;
+  FREE_TRIAL_DAILY_LIMIT?: string;
   COST_USDC?: string;
   COST_SATS?: string;
   UPSTASH_REDIS_REST_URL?: string;
@@ -31,6 +38,7 @@ export interface AppBindings {
   L402_HMAC_SECRET?: string;
   BASE_RPC_URL?: string;
   BASE_RECIPIENT_ADDRESS?: string;
+  ALPHA402_KV?: KVNamespaceLike;
 }
 
 export interface AppVariables {
@@ -40,6 +48,8 @@ export interface AppVariables {
   creditsRemainingUnits?: number;
   creditsRemainingUsdc?: number;
   callsRemaining?: number;
+  freeTrialRemaining?: number;
+  freeTrialLimit?: number;
 }
 
 export interface TokenAlphaRequest {
