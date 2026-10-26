@@ -5,6 +5,7 @@ export interface PaywallConfig {
   costSats: number; // e.g. 20 sats
   baseRecipientAddress: string;
   enableSandbox: boolean; // MUST default to false in production
+  description?: string;
 }
 
 export const DEFAULT_CONFIG: PaywallConfig = {
@@ -17,21 +18,73 @@ export const DEFAULT_CONFIG: PaywallConfig = {
 const BASE_USDC_CONTRACT = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
 const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const DEFAULT_BASE_RPC_URL = 'https://mainnet.base.org';
+const DEFAULT_X402_FACILITATOR_URL = 'https://x402.org/facilitator';
 
-// Maximum age for on-chain Base USDC transaction receipts: 43,200 blocks (~24 hours at 2s/block).
-// Combined with a 7-day Redis nonce TTL, this guarantees transactions can NEVER be replayed after TTL expiry.
+// Maximum age for initial on-chain Base USDC transaction registration: 43,200 blocks (~24 hours at 2s/block).
+// Once registered in Redis, the credit balance lives for 7 days (NONCE_TTL_SECONDS).
 const MAX_TX_AGE_BLOCKS = 43200n;
 const NONCE_TTL_SECONDS = 86400 * 7; // 7 days
 const L402_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 
-// Local dev set ONLY used when explicitly running offline with sandbox enabled (bounded to prevent memory DoS)
+// Local dev stores ONLY used when explicitly running offline with sandbox enabled (bounded to prevent memory DoS)
 const MAX_LOCAL_NONCES = 10000;
 const localSpentTokens = new Set<string>();
+const localCreditBalances = new Map<string, number>();
+
+// Lua scripts for 1-roundtrip atomic prepaid credit accounting in Upstash Redis
+const LUA_TRY_SPEND_EXISTING = `
+local bal = redis.call('GET', KEYS[1])
+if not bal then return -2 end
+local num = tonumber(bal)
+local cost = tonumber(ARGV[1])
+if num < cost then return -1 end
+return redis.call('DECRBY', KEYS[1], cost)
+`;
+
+const LUA_INIT_AND_SPEND = `
+local bal = redis.call('GET', KEYS[1])
+local total = tonumber(ARGV[1])
+local cost = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+if not bal then
+  local rem = total - cost
+  if rem < 0 then return -1 end
+  redis.call('SET', KEYS[1], rem, 'EX', ttl)
+  return rem
+else
+  local num = tonumber(bal)
+  if num < cost then return -1 end
+  return redis.call('DECRBY', KEYS[1], cost)
+end
+`;
+
+const LUA_REFUND_CREDITS = `
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return redis.call('INCRBY', KEYS[1], tonumber(ARGV[1]))
+end
+return -1
+`;
 
 function getEnv(c: Context): Record<string, any> {
   const nodeEnv = typeof process !== 'undefined' && process.env ? process.env : {};
   const workerEnv = c.env && typeof c.env === 'object' ? c.env : {};
   return { ...nodeEnv, ...workerEnv };
+}
+
+function toBase64Json(obj: Record<string, any>): string {
+  const jsonStr = JSON.stringify(obj);
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(jsonStr, 'utf-8').toString('base64');
+  }
+  return btoa(jsonStr);
+}
+
+function fromBase64Json(b64: string): any {
+  const decoded =
+    typeof Buffer !== 'undefined'
+      ? Buffer.from(b64, 'base64').toString('utf-8')
+      : atob(b64);
+  return JSON.parse(decoded);
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -69,10 +122,152 @@ export async function createSignedL402Token(
   return `alpha402_${timestamp}_${cleanHash}_${mac}`;
 }
 
+async function upstashCommand(
+  upstashUrl: string,
+  upstashToken: string,
+  command: (string | number)[]
+): Promise<{ ok: boolean; result?: any }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3000);
+  try {
+    const res = await fetch(upstashUrl, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${upstashToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(command),
+    });
+
+    if (!res.ok) {
+      console.error(`Upstash Redis error: HTTP ${res.status}`);
+      return { ok: false };
+    }
+
+    const data: any = await res.json();
+    if (data?.error) {
+      console.error(`Upstash Redis command error: ${data.error}`);
+      return { ok: false };
+    }
+    return { ok: true, result: data?.result };
+  } catch (e) {
+    console.error('Upstash Redis request error:', e);
+    return { ok: false };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /**
- * Atomic Distributed Nonce Settlement via Upstash Redis REST POST
- * Sends JSON command array to eliminate any REST path URL injection.
- * Fails closed with 503 if Redis is unreachable or non-200.
+ * Fast-Path Prepaid Credit Spend (0 Base RPC calls when txHash is already indexed!)
+ */
+async function trySpendExistingCredits(
+  creditKey: string,
+  costUnits: number,
+  env: Record<string, any>,
+  sandboxActive: boolean
+): Promise<
+  | { status: 'NOT_INDEXED' }
+  | { status: 'CLAIMED'; remainingUnits: number }
+  | { status: 'INSUFFICIENT_CREDITS' }
+  | { status: 'STORE_ERROR' }
+> {
+  const upstashUrl = env.UPSTASH_REDIS_REST_URL;
+  const upstashToken = env.UPSTASH_REDIS_REST_TOKEN;
+
+  if (upstashUrl && upstashToken) {
+    const res = await upstashCommand(upstashUrl, upstashToken, [
+      'EVAL',
+      LUA_TRY_SPEND_EXISTING,
+      1,
+      `alpha402:credits:${creditKey}`,
+      costUnits,
+    ]);
+    if (!res.ok || typeof res.result !== 'number') {
+      return { status: 'STORE_ERROR' };
+    }
+    if (res.result === -2) return { status: 'NOT_INDEXED' };
+    if (res.result === -1) return { status: 'INSUFFICIENT_CREDITS' };
+    return { status: 'CLAIMED', remainingUnits: res.result };
+  }
+
+  if (sandboxActive) {
+    if (!localCreditBalances.has(creditKey)) {
+      return { status: 'NOT_INDEXED' };
+    }
+    const current = localCreditBalances.get(creditKey)!;
+    if (current < costUnits) {
+      return { status: 'INSUFFICIENT_CREDITS' };
+    }
+    const rem = current - costUnits;
+    localCreditBalances.set(creditKey, rem);
+    return { status: 'CLAIMED', remainingUnits: rem };
+  }
+
+  console.error('FATAL: UPSTASH_REDIS_REST_URL not configured in production. Failing closed.');
+  return { status: 'STORE_ERROR' };
+}
+
+/**
+ * First-Use Prepaid Credit Initialization + Atomic Spend
+ */
+async function initAndSpendCredits(
+  creditKey: string,
+  totalDepositUnits: number,
+  costUnits: number,
+  ttlSeconds: number,
+  env: Record<string, any>,
+  sandboxActive: boolean
+): Promise<
+  | { status: 'CLAIMED'; remainingUnits: number }
+  | { status: 'INSUFFICIENT_CREDITS' }
+  | { status: 'STORE_ERROR' }
+> {
+  const upstashUrl = env.UPSTASH_REDIS_REST_URL;
+  const upstashToken = env.UPSTASH_REDIS_REST_TOKEN;
+
+  if (upstashUrl && upstashToken) {
+    const res = await upstashCommand(upstashUrl, upstashToken, [
+      'EVAL',
+      LUA_INIT_AND_SPEND,
+      1,
+      `alpha402:credits:${creditKey}`,
+      totalDepositUnits,
+      costUnits,
+      ttlSeconds,
+    ]);
+    if (!res.ok || typeof res.result !== 'number') {
+      return { status: 'STORE_ERROR' };
+    }
+    if (res.result < 0) {
+      return { status: 'INSUFFICIENT_CREDITS' };
+    }
+    return { status: 'CLAIMED', remainingUnits: res.result };
+  }
+
+  if (sandboxActive) {
+    const current = localCreditBalances.has(creditKey)
+      ? localCreditBalances.get(creditKey)!
+      : totalDepositUnits;
+    if (current < costUnits) {
+      return { status: 'INSUFFICIENT_CREDITS' };
+    }
+    if (!localCreditBalances.has(creditKey) && localCreditBalances.size >= MAX_LOCAL_NONCES) {
+      const oldest = localCreditBalances.keys().next().value;
+      if (oldest !== undefined) localCreditBalances.delete(oldest);
+    }
+    const rem = current - costUnits;
+    localCreditBalances.set(creditKey, rem);
+    return { status: 'CLAIMED', remainingUnits: rem };
+  }
+
+  console.error('FATAL: UPSTASH_REDIS_REST_URL not configured in production. Failing closed.');
+  return { status: 'STORE_ERROR' };
+}
+
+/**
+ * Atomic Distributed Nonce Settlement via Upstash Redis REST POST (for single-use L402 & EIP-3009 proofs)
  */
 async function atomicClaimNonce(
   nonceKey: string,
@@ -88,36 +283,18 @@ async function atomicClaimNonce(
   const upstashToken = env.UPSTASH_REDIS_REST_TOKEN;
 
   if (upstashUrl && upstashToken) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
-    try {
-      // POST command array: ["SET", key, "1", "EX", ttl, "NX"]
-      const res = await fetch(upstashUrl, {
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-          Authorization: `Bearer ${upstashToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(['SET', `alpha402:nonce:${nonceKey}`, '1', 'EX', ttlSeconds, 'NX']),
-      });
-
-      if (!res.ok) {
-        console.error(`Upstash Redis error: HTTP ${res.status}`);
-        return 'STORE_ERROR'; // Fail closed!
-      }
-
-      const data: any = await res.json();
-      return data?.result === 'OK' ? 'CLAIMED' : 'ALREADY_SPENT';
-    } catch (e) {
-      console.error('Upstash atomic nonce check error:', e);
-      return 'STORE_ERROR'; // Fail closed!
-    } finally {
-      clearTimeout(timeout);
-    }
+    const res = await upstashCommand(upstashUrl, upstashToken, [
+      'SET',
+      `alpha402:nonce:${nonceKey}`,
+      '1',
+      'EX',
+      ttlSeconds,
+      'NX',
+    ]);
+    if (!res.ok) return 'STORE_ERROR';
+    return res.result === 'OK' ? 'CLAIMED' : 'ALREADY_SPENT';
   }
 
-  // If Upstash is not configured: only allow if sandbox is explicitly active
   if (sandboxActive) {
     if (localSpentTokens.has(nonceKey)) {
       return 'ALREADY_SPENT';
@@ -130,51 +307,61 @@ async function atomicClaimNonce(
     return 'CLAIMED';
   }
 
-  // Production with no Redis configured MUST fail closed
   console.error('FATAL: UPSTASH_REDIS_REST_URL not configured in production. Failing closed.');
   return 'STORE_ERROR';
 }
 
 /**
- * Rollback Nonce on Provider Failure via POST ["DEL", key]
- * Does NOT swallow errors: returns boolean reflecting actual Redis status.
+ * Rollback Nonce or Refund Prepaid Credits on Provider Failure
+ * - For prepaid x402 credits (`x402:...`): atomically refunds `paymentCostUnits` via INCRBY
+ * - For single-use L402 / EIP-3009 nonces: atomically deletes the nonce via DEL
  */
 export async function releaseNonce(c: Context): Promise<boolean> {
   const paymentProof = c.get('paymentProof');
   if (!paymentProof || typeof paymentProof !== 'string') return false;
 
+  const costUnits = Number(c.get('paymentCostUnits') || 0);
   const env = getEnv(c);
   const upstashUrl = env.UPSTASH_REDIS_REST_URL;
   const upstashToken = env.UPSTASH_REDIS_REST_TOKEN;
 
-  if (upstashUrl && upstashToken) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
-    try {
-      const res = await fetch(upstashUrl, {
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-          Authorization: `Bearer ${upstashToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(['DEL', `alpha402:nonce:${paymentProof}`]),
-      });
+  const isPrepaidCredit = paymentProof.startsWith('x402:') && costUnits > 0;
 
-      if (res.ok) {
-        const data: any = await res.json();
-        return typeof data?.result === 'number' && data.result > 0;
+  if (upstashUrl && upstashToken) {
+    if (isPrepaidCredit) {
+      const res = await upstashCommand(upstashUrl, upstashToken, [
+        'EVAL',
+        LUA_REFUND_CREDITS,
+        1,
+        `alpha402:credits:${paymentProof}`,
+        costUnits,
+      ]);
+      if (res.ok && typeof res.result === 'number' && res.result >= 0) {
+        c.set('creditsRemainingUnits', res.result);
+        c.set('creditsRemainingUsdc', Number((res.result / 1_000_000).toFixed(6)));
+        c.set('callsRemaining', Math.floor(res.result / costUnits));
+        return true;
       }
-      return false; // Upstash returned error, do not pretend it succeeded
-    } catch (e) {
-      console.error('Failed to release nonce in Upstash:', e);
       return false;
-    } finally {
-      clearTimeout(timeout);
     }
+
+    const res = await upstashCommand(upstashUrl, upstashToken, [
+      'DEL',
+      `alpha402:nonce:${paymentProof}`,
+    ]);
+    return res.ok && typeof res.result === 'number' && res.result > 0;
   }
 
   if (env.ENABLE_SANDBOX === 'true') {
+    if (isPrepaidCredit) {
+      if (!localCreditBalances.has(paymentProof)) return false;
+      const newBal = localCreditBalances.get(paymentProof)! + costUnits;
+      localCreditBalances.set(paymentProof, newBal);
+      c.set('creditsRemainingUnits', newBal);
+      c.set('creditsRemainingUsdc', Number((newBal / 1_000_000).toFixed(6)));
+      c.set('callsRemaining', Math.floor(newBal / costUnits));
+      return true;
+    }
     return localSpentTokens.delete(paymentProof);
   }
 
@@ -182,17 +369,152 @@ export async function releaseNonce(c: Context): Promise<boolean> {
 }
 
 /**
+ * Official Coinbase x402 Protocol Payment Requirement Object (x402Version: 1)
+ */
+function buildCoinbaseX402Requirement(
+  resourceUrl: string,
+  recipientAddress: string,
+  costUnits: number,
+  description: string
+) {
+  return {
+    scheme: 'exact',
+    network: 'base',
+    maxAmountRequired: costUnits.toString(),
+    resource: resourceUrl,
+    description,
+    mimeType: 'application/json',
+    payTo: recipientAddress,
+    maxTimeoutSeconds: 60,
+    asset: BASE_USDC_CONTRACT,
+    extra: {
+      name: 'USD Coin',
+      version: '2',
+      prepaidSupported: true,
+    },
+  };
+}
+
+/**
+ * Official Coinbase x402 Facilitator Verification & Settlement
+ * Supports EIP-3009 `transferWithAuthorization` payloads sent via the standard `X-PAYMENT` header
+ * by `x402-fetch`, `x402-axios`, and Coinbase CDP AgentKit clients.
+ */
+async function verifyAndSettleCoinbaseX402(
+  xPaymentHeaderB64: string,
+  paymentRequirements: Record<string, any>,
+  facilitatorUrl: string
+): Promise<{
+  verified: boolean;
+  txHash?: string;
+  nonceId?: string;
+  reason?: string;
+}> {
+  let decoded: any;
+  try {
+    decoded = fromBase64Json(xPaymentHeaderB64);
+  } catch {
+    return { verified: false, reason: 'Invalid base64 encoding in X-PAYMENT header' };
+  }
+
+  if (!decoded || typeof decoded !== 'object') {
+    return { verified: false, reason: 'Malformed JSON payload in X-PAYMENT header' };
+  }
+
+  // If the client wrapped an on-chain Base txHash inside X-PAYMENT JSON, let caller handle it via prepaid credits
+  const embeddedTxHash = decoded?.payload?.txHash || decoded?.txHash;
+  if (typeof embeddedTxHash === 'string' && /^0x[a-fA-F0-9]{64}$/.test(embeddedTxHash)) {
+    return { verified: true, txHash: embeddedTxHash };
+  }
+
+  // Extract EIP-3009 authorization nonce to prevent replay before settling
+  const authNonce =
+    decoded?.payload?.authorization?.nonce ||
+    decoded?.authorization?.nonce ||
+    '';
+  const cleanNonce = String(authNonce).replace(/[^a-zA-Z0-9_-]/g, '');
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    const verifyRes = await fetch(`${facilitatorUrl.replace(/\/$/, '')}/verify`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        x402Version: decoded.x402Version || 1,
+        paymentHeader: xPaymentHeaderB64,
+        paymentRequirements,
+      }),
+    });
+
+    if (!verifyRes.ok) {
+      return {
+        verified: false,
+        reason: `Coinbase x402 facilitator verify HTTP ${verifyRes.status}`,
+      };
+    }
+
+    const verifyJson: any = await verifyRes.json();
+    if (!verifyJson?.isValid) {
+      return {
+        verified: false,
+        reason: verifyJson?.invalidReason || 'Coinbase x402 facilitator rejected payment signature',
+      };
+    }
+
+    const settleRes = await fetch(`${facilitatorUrl.replace(/\/$/, '')}/settle`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        x402Version: decoded.x402Version || 1,
+        paymentHeader: xPaymentHeaderB64,
+        paymentRequirements,
+      }),
+    });
+
+    if (!settleRes.ok) {
+      return {
+        verified: false,
+        reason: `Coinbase x402 facilitator settle HTTP ${settleRes.status}`,
+      };
+    }
+
+    const settleJson: any = await settleRes.json();
+    if (!settleJson?.success && !settleJson?.txHash && !settleJson?.transaction) {
+      return {
+        verified: false,
+        reason: settleJson?.error || 'Coinbase x402 facilitator settlement failed',
+      };
+    }
+
+    const settledTx = String(settleJson.txHash || settleJson.transaction || '').toLowerCase();
+    return {
+      verified: true,
+      txHash: settledTx || undefined,
+      nonceId: cleanNonce || settledTx.replace(/^0x/, ''),
+    };
+  } catch (err: any) {
+    return {
+      verified: false,
+      reason: `Coinbase x402 facilitator error: ${err?.message || 'Unknown error'}`,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
  * On-Chain Base RPC Receipt Verification
- * Verifies that the transaction was mined within the last 24h (43,200 blocks),
- * succeeded against Base USDC, transferred >= minUnits, and paid the merchant address.
  */
 async function verifyBaseUsdcReceipt(
   txHash: string,
   expectedRecipient: string,
   minUnits: bigint,
   rpcUrl: string
-): Promise<{ verified: boolean; reason?: string }> {
-  // Validate txHash format: 0x followed by 64 hex chars
+): Promise<{ verified: boolean; totalUnits?: bigint; reason?: string }> {
   if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
     return { verified: false, reason: 'Invalid transaction hash format' };
   }
@@ -243,7 +565,6 @@ async function verifyBaseUsdcReceipt(
       return { verified: false, reason: 'Transaction reverted on-chain' };
     }
 
-    // Verify transaction block age to prevent replaying old transactions after Redis TTL expires
     if (
       typeof receipt.blockNumber === 'string' &&
       /^0x[a-fA-F0-9]+$/.test(receipt.blockNumber) &&
@@ -262,11 +583,9 @@ async function verifyBaseUsdcReceipt(
       return { verified: false, reason: 'Unable to verify transaction block age from RPC' };
     }
 
-    // Padded 32-byte recipient topic
     const cleanRecipient = expectedRecipient.toLowerCase().replace(/^0x/, '');
     const paddedRecipient = '0x' + cleanRecipient.padStart(64, '0').toLowerCase();
 
-    // Scan logs for Transfer(from, to, value) on Base USDC
     let totalTransferredUnits = 0n;
 
     for (const log of receipt.logs || []) {
@@ -290,7 +609,7 @@ async function verifyBaseUsdcReceipt(
       };
     }
 
-    return { verified: true };
+    return { verified: true, totalUnits: totalTransferredUnits };
   } catch (err: any) {
     return { verified: false, reason: `RPC verification failed: ${err?.message || 'Unknown RPC error'}` };
   } finally {
@@ -300,10 +619,6 @@ async function verifyBaseUsdcReceipt(
 
 /**
  * Cryptographic L402 Token & Preimage Verification
- * 1. Computes full 256-bit SHA-256(preimage)
- * 2. Verifies server HMAC-SHA256 signature on token to prevent client-side token forgery
- * 3. Verifies token timestamp is within 1-hour validity window
- * 4. Returns canonical paymentHash to use as replay-protection nonce key
  */
 async function verifyL402Preimage(
   token: string,
@@ -322,7 +637,6 @@ async function verifyL402Preimage(
     };
   }
 
-  // Strict token format: alpha402_<timestamp>_<paymentHash64>_<hmac64>
   const match = /^alpha402_(\d{10,15})_([a-fA-F0-9]{64})_([a-fA-F0-9]{64})$/.exec(token);
   if (!match) {
     return {
@@ -336,14 +650,12 @@ async function verifyL402Preimage(
   const tokenPaymentHash = tokenPaymentHashRaw.toLowerCase();
   const tokenHmac = tokenHmacRaw.toLowerCase();
 
-  // Check token expiration (1 hour window, max 30s clock skew)
   const ageMs = Date.now() - timestamp;
   if (!Number.isFinite(ageMs) || ageMs < -30_000 || ageMs > L402_MAX_AGE_MS) {
     return { verified: false, reason: 'L402 challenge token has expired' };
   }
 
   try {
-    // 1. Verify HMAC-SHA256 signature so clients cannot forge their own paymentHash tokens
     const expectedHmac = await computeHmacSha256Hex(
       hmacSecret,
       `${timestampStr}:${tokenPaymentHash}:${costSats}`
@@ -352,7 +664,6 @@ async function verifyL402Preimage(
       return { verified: false, reason: 'Invalid L402 token HMAC signature' };
     }
 
-    // 2. Verify SHA-256(preimage) === tokenPaymentHash (full 256-bit comparison)
     const bytes = new Uint8Array(preimageHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)));
     const hashBuffer = await crypto.subtle.digest('SHA-256', bytes);
     const computedHash = Array.from(new Uint8Array(hashBuffer))
@@ -380,6 +691,15 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
     const sandboxActive = cfg.enableSandbox || env.ENABLE_SANDBOX === 'true';
     const recipientAddress = env.BASE_RECIPIENT_ADDRESS || cfg.baseRecipientAddress;
     const rpcUrl = env.BASE_RPC_URL || DEFAULT_BASE_RPC_URL;
+    const facilitatorUrl = env.X402_FACILITATOR_URL || DEFAULT_X402_FACILITATOR_URL;
+    const costUnits = Math.round(cfg.costUsdc * 1_000_000); // e.g., 20,000 units for $0.02
+
+    const paymentRequirement = buildCoinbaseX402Requirement(
+      c.req.url,
+      recipientAddress,
+      costUnits,
+      cfg.description || 'Alpha402 Fail-Closed On-Chain Intelligence'
+    );
 
     // 1. Sandbox demo bypass (ONLY if sandbox is explicitly enabled)
     if (sandboxActive && c.req.query('demo') === 'true') {
@@ -387,42 +707,245 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
       return await next();
     }
 
-    const authHeader = c.req.header('Authorization');
+    const xPaymentHeader = c.req.header('X-PAYMENT') || c.req.header('x-payment');
+    let authHeader = c.req.header('Authorization');
 
-    // 2. Validate Payment if Authorization header is present
-    if (authHeader) {
-      let paymentProof = '';
-      let paymentType = '';
+    // 2. Official Coinbase x402 `X-PAYMENT` Header Support (`x402-fetch`, `x402-axios`, CDP AgentKit)
+    if (xPaymentHeader && !authHeader) {
+      const trimmedXPayment = xPaymentHeader.trim();
+      // Support raw txHash in X-PAYMENT as well as standard Base64 EIP-3009 JSON payload
+      if (/^0x[a-fA-F0-9]{64}$/.test(trimmedXPayment) || /^TEST_TX_/.test(trimmedXPayment)) {
+        authHeader = `x402 ${trimmedXPayment}`;
+      } else {
+        const cbVerification = await verifyAndSettleCoinbaseX402(
+          trimmedXPayment,
+          paymentRequirement,
+          facilitatorUrl
+        );
 
-      // Check x402 EVM/Base format: "x402 <tx_hash>"
-      if (authHeader.startsWith('x402 ')) {
-        const txHash = authHeader.slice(5).trim();
+        if (!cbVerification.verified) {
+          return c.json(
+            {
+              x402Version: 1,
+              error: 'Payment Verification Failed',
+              statusCode: 402,
+              reason: cbVerification.reason,
+              accepts: [paymentRequirement],
+            },
+            402
+          );
+        }
 
-        // Sandbox simulated proofs ONLY permitted when sandboxActive === true
-        if (sandboxActive && /^TEST_TX_[a-zA-Z0-9_-]{1,64}$/.test(txHash)) {
-          paymentProof = `x402:sandbox:${txHash}`;
-          paymentType = 'x402_Sandbox_Simulated';
+        // If client passed an on-chain Base txHash inside the X-PAYMENT JSON, route to prepaid credit engine
+        if (cbVerification.txHash && !cbVerification.nonceId) {
+          authHeader = `x402 ${cbVerification.txHash}`;
         } else {
-          // REAL PRODUCTION VERIFICATION: Query Base RPC
-          const minUsdcUnits = BigInt(Math.round(cfg.costUsdc * 1_000_000)); // 20,000 units for $0.02
-          const verification = await verifyBaseUsdcReceipt(txHash, recipientAddress, minUsdcUnits, rpcUrl);
+          const nonceKey = `x402_cb:${cbVerification.nonceId || crypto.randomUUID().replace(/-/g, '')}`;
+          const claimResult = await atomicClaimNonce(nonceKey, NONCE_TTL_SECONDS, env, sandboxActive);
 
-          if (!verification.verified) {
+          if (claimResult === 'STORE_ERROR') {
             return c.json(
               {
-                error: 'Payment Verification Failed',
+                error: 'Service Unavailable',
+                statusCode: 503,
+                reason: 'Replay protection store unreachable. Failing closed.',
+              },
+              503
+            );
+          }
+
+          if (claimResult === 'ALREADY_SPENT') {
+            return c.json(
+              {
+                x402Version: 1,
+                error: 'Payment Required - Proof already redeemed',
                 statusCode: 402,
-                reason: verification.reason,
+                reason: 'Replay protection: This EIP-3009 authorization has already been consumed.',
+                accepts: [paymentRequirement],
               },
               402
             );
           }
 
-          paymentProof = `x402:${txHash.toLowerCase()}`;
-          paymentType = 'x402_Base_USDC_OnChain_Verified';
+          c.set('paymentType', 'x402_Coinbase_Facilitator_Verified');
+          c.set('paymentProof', nonceKey);
+          c.set('paymentCostUnits', 0);
+
+          c.header(
+            'X-PAYMENT-RESPONSE',
+            toBase64Json({
+              success: true,
+              txHash: cbVerification.txHash || null,
+              networkId: 'base',
+            })
+          );
+
+          await next();
+          return;
         }
-      } else if (authHeader.startsWith('L402 ')) {
-        // Check L402 format: "L402 <token>:<preimage>"
+      }
+    }
+
+    // 3. Validate Payment if Authorization header is present
+    if (authHeader) {
+      // Check x402 EVM/Base format: "x402 <tx_hash>" (Supports both single-call $0.02 & multi-call prepaid deposits!)
+      if (authHeader.startsWith('x402 ')) {
+        const txHash = authHeader.slice(5).trim();
+        let creditKey = '';
+        let paymentType = '';
+        let simulatedDepositUnits: number | null = null;
+
+        // Sandbox simulated proofs ONLY permitted when sandboxActive === true
+        // Format: TEST_TX_<id> (1 call) or TEST_TX_USD_<dollars>_<id> (multi-call prepaid test)
+        if (sandboxActive && /^TEST_TX_[a-zA-Z0-9_.-]{1,64}$/.test(txHash)) {
+          creditKey = `x402:sandbox:${txHash}`;
+          paymentType = 'x402_Sandbox_Simulated';
+          const multiMatch = /^TEST_TX_USD_(\d+(?:\.\d+)?)_/.exec(txHash);
+          simulatedDepositUnits = multiMatch
+            ? Math.round(parseFloat(multiMatch[1]) * 1_000_000)
+            : costUnits;
+        } else if (/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
+          creditKey = `x402:${txHash.toLowerCase()}`;
+          paymentType = 'x402_Base_USDC_OnChain_Verified';
+        } else {
+          return c.json(
+            {
+              x402Version: 1,
+              error: 'Payment Verification Failed',
+              statusCode: 402,
+              reason: 'Invalid transaction hash format',
+              accepts: [paymentRequirement],
+            },
+            402
+          );
+        }
+
+        // STEP 3A: Fast-path Redis credit check (0 Base RPC calls if txHash was already verified!)
+        const fastSpend = await trySpendExistingCredits(creditKey, costUnits, env, sandboxActive);
+
+        if (fastSpend.status === 'STORE_ERROR') {
+          return c.json(
+            {
+              error: 'Service Unavailable',
+              statusCode: 503,
+              reason: 'Replay protection and credit store unreachable. Failing closed to prevent double-spending.',
+            },
+            503
+          );
+        }
+
+        if (fastSpend.status === 'INSUFFICIENT_CREDITS') {
+          return c.json(
+            {
+              x402Version: 1,
+              error: 'Payment Required - Proof or Prepaid Credit Exhausted',
+              statusCode: 402,
+              reason:
+                'All credits from this transaction hash have been consumed. Send a new Base USDC transfer (e.g. $0.02 for 1 call or $1.00 for 50 instant calls).',
+              accepts: [paymentRequirement],
+            },
+            402
+          );
+        }
+
+        let remainingUnits = 0;
+
+        if (fastSpend.status === 'CLAIMED') {
+          remainingUnits = fastSpend.remainingUnits;
+          if (paymentType === 'x402_Base_USDC_OnChain_Verified') {
+            paymentType = 'x402_Base_USDC_Prepaid_Session_Instant';
+          }
+        } else {
+          // STEP 3B: First time seeing this txHash -> Verify on Base RPC once and initialize credit balance!
+          let totalDepositUnits = simulatedDepositUnits ?? 0;
+
+          if (simulatedDepositUnits === null) {
+            const minUsdcUnits = BigInt(costUnits);
+            const verification = await verifyBaseUsdcReceipt(txHash, recipientAddress, minUsdcUnits, rpcUrl);
+
+            if (!verification.verified || verification.totalUnits === undefined) {
+              return c.json(
+                {
+                  x402Version: 1,
+                  error: 'Payment Verification Failed',
+                  statusCode: 402,
+                  reason: verification.reason,
+                  accepts: [paymentRequirement],
+                },
+                402
+              );
+            }
+
+            const cappedUnits =
+              verification.totalUnits > 10_000_000_000n ? 10_000_000_000n : verification.totalUnits;
+            totalDepositUnits = Number(cappedUnits);
+          }
+
+          const initSpend = await initAndSpendCredits(
+            creditKey,
+            totalDepositUnits,
+            costUnits,
+            NONCE_TTL_SECONDS,
+            env,
+            sandboxActive
+          );
+
+          if (initSpend.status === 'STORE_ERROR') {
+            return c.json(
+              {
+                error: 'Service Unavailable',
+                statusCode: 503,
+                reason: 'Replay protection and credit store unreachable. Failing closed to prevent double-spending.',
+              },
+              503
+            );
+          }
+
+          if (initSpend.status === 'INSUFFICIENT_CREDITS') {
+            return c.json(
+              {
+                x402Version: 1,
+                error: 'Payment Required - Proof or Prepaid Credit Exhausted',
+                statusCode: 402,
+                reason: 'Insufficient USDC transferred for this endpoint tier.',
+                accepts: [paymentRequirement],
+              },
+              402
+            );
+          }
+
+          remainingUnits = initSpend.remainingUnits;
+        }
+
+        const remainingUsdc = Number((remainingUnits / 1_000_000).toFixed(6));
+        const callsRemaining = Math.floor(remainingUnits / costUnits);
+
+        c.set('paymentType', paymentType);
+        c.set('paymentProof', creditKey);
+        c.set('paymentCostUnits', costUnits);
+        c.set('creditsRemainingUnits', remainingUnits);
+        c.set('creditsRemainingUsdc', remainingUsdc);
+        c.set('callsRemaining', callsRemaining);
+
+        c.header('X-402-Credits-Remaining-USDC', remainingUsdc.toFixed(6));
+        c.header('X-402-Calls-Remaining', callsRemaining.toString());
+        c.header(
+          'X-PAYMENT-RESPONSE',
+          toBase64Json({
+            success: true,
+            txHash: txHash.startsWith('0x') ? txHash.toLowerCase() : txHash,
+            networkId: 'base',
+            creditsRemainingUsdc: remainingUsdc,
+            callsRemaining,
+          })
+        );
+
+        await next();
+        return;
+      }
+
+      // Check L402 format: "L402 <token>:<preimage>"
+      if (authHeader.startsWith('L402 ')) {
         const credentials = authHeader.slice(5).trim();
         const colonIdx = credentials.indexOf(':');
         const token = colonIdx > 0 ? credentials.slice(0, colonIdx).trim() : '';
@@ -431,13 +954,18 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
         if (!token || !preimage) {
           return c.json(
             {
+              x402Version: 1,
               error: 'Payment Verification Failed',
               statusCode: 402,
               reason: 'Malformed L402 header. Expected format: "Authorization: L402 <token>:<preimage>"',
+              accepts: [paymentRequirement],
             },
             402
           );
         }
+
+        let paymentProof = '';
+        let paymentType = '';
 
         if (
           sandboxActive &&
@@ -447,7 +975,6 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
           paymentProof = `l402:sandbox:${token}`;
           paymentType = 'L402_Sandbox_Simulated';
         } else {
-          // Cryptographic HMAC + SHA-256 verification
           const verification = await verifyL402Preimage(
             token,
             preimage,
@@ -457,30 +984,19 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
           if (!verification.verified || !verification.paymentHash) {
             return c.json(
               {
+                x402Version: 1,
                 error: 'Payment Verification Failed',
                 statusCode: 402,
                 reason: verification.reason || 'Invalid L402 payment proof',
+                accepts: [paymentRequirement],
               },
               402
             );
           }
-          // Canonical nonce key is the paymentHash itself so token string mutations cannot replay a preimage
           paymentProof = `l402:${verification.paymentHash}`;
           paymentType = 'L402_Lightning_Cryptographic_Verified';
         }
-      } else {
-        return c.json(
-          {
-            error: 'Payment Verification Failed',
-            statusCode: 402,
-            reason: 'Unsupported Authorization scheme. Use "x402 <tx_hash>" or "L402 <token>:<preimage>".',
-          },
-          402
-        );
-      }
 
-      if (paymentProof) {
-        // Atomic Check & Set before serving response
         const claimResult = await atomicClaimNonce(paymentProof, NONCE_TTL_SECONDS, env, sandboxActive);
 
         if (claimResult === 'STORE_ERROR') {
@@ -497,9 +1013,11 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
         if (claimResult === 'ALREADY_SPENT') {
           return c.json(
             {
+              x402Version: 1,
               error: 'Payment Required - Proof already redeemed',
               statusCode: 402,
-              reason: 'Replay protection: This payment proof or transaction hash has already been consumed.',
+              reason: 'Replay protection: This payment proof has already been consumed.',
+              accepts: [paymentRequirement],
             },
             402
           );
@@ -507,13 +1025,25 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
 
         c.set('paymentType', paymentType);
         c.set('paymentProof', paymentProof);
+        c.set('paymentCostUnits', 0);
 
         await next();
         return;
       }
+
+      return c.json(
+        {
+          x402Version: 1,
+          error: 'Payment Verification Failed',
+          statusCode: 402,
+          reason: 'Unsupported Authorization scheme. Use "X-PAYMENT: <base64>", "Authorization: x402 <tx_hash>", or "Authorization: L402 <token>:<preimage>".',
+          accepts: [paymentRequirement],
+        },
+        402
+      );
     }
 
-    // 3. No valid payment presented -> Issue HTTP 402 challenge
+    // 4. No valid payment presented -> Issue HTTP 402 challenge (Compatible with Coinbase x402 v1, Prepaid x402, and L402)
     const randomBytes = new Uint8Array(32);
     crypto.getRandomValues(randomBytes);
     const challengeHash = Array.from(randomBytes)
@@ -533,21 +1063,36 @@ export function paywall402(config: Partial<PaywallConfig> = {}) {
 
     return c.json(
       {
+        x402Version: 1,
+        accepts: [paymentRequirement],
         error: 'Payment Required',
         statusCode: 402,
-        message: 'This API requires micro-payment from your AI Agent wallet.',
+        message:
+          'This API requires micro-payment from your AI Agent wallet. Supports Coinbase x402 (X-PAYMENT header), Prepaid Base USDC (Authorization: x402 <tx_hash>), and Lightning L402.',
         pricing: {
           costUsdc: cfg.costUsdc,
           costSats: cfg.costSats,
+          prepaidBundles: {
+            '$0.02 USDC': '1 token-alpha call (or 4 security-only calls)',
+            '$1.00 USDC': '50 instant token-alpha calls (or 200 security-only calls) on the same tx_hash',
+            '$5.00 USDC': '250 instant token-alpha calls (or 1,000 security-only calls) on the same tx_hash',
+          },
         },
         paymentOptions: {
+          coinbaseX402: {
+            protocol: 'Official Coinbase x402 (EIP-3009 / x402-fetch / CDP AgentKit)',
+            headerFormat: 'X-PAYMENT: <base64_x402_payload>',
+            facilitator: facilitatorUrl,
+          },
           x402: {
-            protocol: 'EVM / Base USDC',
+            protocol: 'EVM / Base USDC (Single-Call or Multi-Call Prepaid Deposit)',
             network: 'base',
             amountUsdc: cfg.costUsdc,
             usdcContract: BASE_USDC_CONTRACT,
             recipient: recipientAddress,
             settleFormat: 'Authorization: x402 <transaction_hash>',
+            prepaidNote:
+              'Deposit any amount >= costUsdc in one Base USDC transfer and reuse the same tx_hash across requests with zero RPC latency until your credit balance reaches 0.',
           },
           l402: {
             protocol: 'Lightning Network',

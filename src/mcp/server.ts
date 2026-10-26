@@ -1,72 +1,94 @@
 #!/usr/bin/env node
-import { fetchDexData } from '../services/dexscreener.js';
-import { fetchSecurityReport } from '../services/goplus.js';
-import { fetchPolymarketAlpha } from '../services/polymarket.js';
-import { computeAlphaSignal } from '../services/alphaEngine.js';
-import { Network, SUPPORTED_NETWORKS, isValidNetwork, isValidTokenAddress } from '../types.js';
+import app, { MCP_TOOLS } from '../index.js';
+import { SUPPORTED_NETWORKS, isValidNetwork, isValidTokenAddress } from '../types.js';
 import * as readline from 'readline';
 
 /**
- * Model Context Protocol (MCP) Server for Alpha402
- * Allows Claude Desktop, Cursor, and Autonomous Agents to consume 402-enabled alpha signals via Stdio.
+ * Model Context Protocol (MCP) Gateway Client for Alpha402
+ * Routes all MCP tool executions through the HTTP 402 Paywall (never runs unauthenticated local scraping).
+ * Supports:
+ * - Prepaid Multi-Call Base USDC deposits (`ALPHA402_TX_HASH=0x...` or `paymentProof: "x402 0x..."`)
+ * - Official Coinbase x402 (`ALPHA402_X_PAYMENT=<base64>` or `paymentProof: "<base64>"`)
+ * - Lightning L402 (`paymentProof: "L402 <token>:<preimage>"`)
  */
+
+const REMOTE_GATEWAY_URL = (
+  process.env.ALPHA402_API_URL ||
+  process.env.API_BASE ||
+  'https://alpha402.monsterbyurbed11.workers.dev'
+).replace(/\/$/, '');
+
+// Session-cached payment proof so a $1.00 USDC prepaid deposit automatically powers subsequent MCP tool calls
+let cachedSessionPaymentProof: string =
+  process.env.ALPHA402_PAYMENT_PROOF ||
+  (process.env.ALPHA402_TX_HASH ? `x402 ${process.env.ALPHA402_TX_HASH.trim()}` : '') ||
+  process.env.ALPHA402_X_PAYMENT ||
+  '';
+
+function buildPaymentHeaders(rawProof?: string): Record<string, string> {
+  const proof = (rawProof || cachedSessionPaymentProof || '').trim();
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+  };
+
+  if (!proof) return headers;
+
+  if (proof.startsWith('x402 ') || proof.startsWith('L402 ')) {
+    headers['Authorization'] = proof;
+  } else if (/^0x[a-fA-F0-9]{64}$/.test(proof) || /^TEST_TX_/.test(proof)) {
+    headers['Authorization'] = `x402 ${proof}`;
+  } else {
+    headers['X-PAYMENT'] = proof;
+  }
+
+  return headers;
+}
+
+async function callPaywalledGateway(
+  path: string,
+  paymentProof?: string
+): Promise<{ status: number; data: any }> {
+  const headers = buildPaymentHeaders(paymentProof);
+
+  // If explicitly configured to use in-process Hono app (still enforces paywall402!) or remote gateway
+  if (process.env.ALPHA402_USE_LOCAL_APP !== 'true') {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(`${REMOTE_GATEWAY_URL}${path}`, {
+        method: 'GET',
+        headers,
+        signal: controller.signal,
+      });
+      const data = await res.json();
+      if (res.ok && paymentProof) {
+        cachedSessionPaymentProof = paymentProof.trim();
+      }
+      return { status: res.status, data };
+    } catch {
+      // Fallback to in-process Hono app (which STILL enforces paywall402 with ENABLE_SANDBOX=false)
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  const localRes = await app.request(path, {
+    method: 'GET',
+    headers,
+  });
+  const localData = await localRes.json();
+  if (localRes.ok && paymentProof) {
+    cachedSessionPaymentProof = paymentProof.trim();
+  }
+  return { status: localRes.status, data: localData };
+}
 
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
   terminal: false,
 });
-
-const TOOLS = [
-  {
-    name: 'check_token_security',
-    description:
-      'Fast fail-closed anti-honeypot and smart contract security audit (checks honeypots, high buy/sell tax, blacklist, freeze authority, balance modification). Micro-tier: $0.005.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        network: {
-          type: 'string',
-          enum: [...SUPPORTED_NETWORKS],
-          description: 'Blockchain network (default is base)',
-        },
-        address: {
-          type: 'string',
-          description: 'The smart contract address or token mint address',
-        },
-      },
-      required: ['address'],
-    },
-  },
-  {
-    name: 'get_token_alpha',
-    description:
-      'Performs fail-closed real-time security audit (is_honeypot, sell taxes, balance modifications), volume momentum analysis, and liquidity depth scoring for any token. Supports Base, Solana, Ethereum, BSC, Arbitrum, Polygon.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        network: {
-          type: 'string',
-          enum: [...SUPPORTED_NETWORKS],
-          description: 'Blockchain network (default is base)',
-        },
-        address: {
-          type: 'string',
-          description: 'The smart contract address or token mint address',
-        },
-      },
-      required: ['address'],
-    },
-  },
-  {
-    name: 'get_polymarket_alpha',
-    description: 'Retrieves top volume prediction markets, outcomes, prices, and arbitrage spreads from Polymarket.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-];
 
 rl.on('line', async (line) => {
   if (!line.trim()) return;
@@ -95,7 +117,7 @@ rl.on('line', async (line) => {
           capabilities: { tools: {} },
           serverInfo: {
             name: 'alpha402-intelligence-mcp',
-            version: '1.4.0',
+            version: '1.5.0',
           },
         },
       });
@@ -119,7 +141,7 @@ rl.on('line', async (line) => {
       sendResponse({
         jsonrpc: '2.0',
         id: id ?? null,
-        result: { tools: TOOLS },
+        result: { tools: MCP_TOOLS },
       });
       return;
     }
@@ -127,6 +149,7 @@ rl.on('line', async (line) => {
     if (method === 'tools/call') {
       const toolName = params?.name;
       const args = params?.arguments || {};
+      const paymentProof = typeof args.paymentProof === 'string' ? args.paymentProof : undefined;
 
       if (toolName === 'check_token_security' || toolName === 'get_token_alpha') {
         const rawNetwork = String(args.network || 'base').toLowerCase();
@@ -170,97 +193,33 @@ rl.on('line', async (line) => {
           return;
         }
 
-        const network: Network = rawNetwork;
+        const endpointPath =
+          toolName === 'check_token_security'
+            ? `/v1/token-security?network=${encodeURIComponent(rawNetwork)}&address=${encodeURIComponent(address)}`
+            : `/v1/token-alpha?network=${encodeURIComponent(rawNetwork)}&address=${encodeURIComponent(address)}`;
 
-        if (toolName === 'check_token_security') {
-          const securityReport = await fetchSecurityReport(network, address);
-          const isVerified = securityReport.auditStatus === 'VERIFIED';
-          sendResponse({
-            jsonrpc: '2.0',
-            id: id ?? null,
-            result: {
-              content: [
-                {
-                  type: 'text',
-                  text: JSON.stringify(securityReport, null, 2),
-                },
-              ],
-              ...(isVerified ? {} : { isError: true }),
-            },
-          });
-          return;
-        }
-
-        if (toolName === 'get_token_alpha') {
-          const [dexData, securityReport] = await Promise.all([
-            fetchDexData(address, network),
-            fetchSecurityReport(network, address),
-          ]);
-
-          if (!dexData) {
-            sendResponse({
-              jsonrpc: '2.0',
-              id: id ?? null,
-              result: {
-                content: [
-                  {
-                    type: 'text',
-                    text: JSON.stringify({ error: `No active liquidity pools found for ${address} on ${network}.` }),
-                  },
-                ],
-                isError: true,
+        const { status, data } = await callPaywalledGateway(endpointPath, paymentProof);
+        sendResponse({
+          jsonrpc: '2.0',
+          id: id ?? null,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(data, null, 2),
               },
-            });
-            return;
-          }
-
-          if (securityReport.auditStatus !== 'VERIFIED') {
-            sendResponse({
-              jsonrpc: '2.0',
-              id: id ?? null,
-              result: {
-                content: [
-                  {
-                    type: 'text',
-                    text: JSON.stringify(
-                      {
-                        success: false,
-                        error: 'Security audit unavailable or timed out. Failing closed.',
-                        auditStatus: securityReport.auditStatus,
-                        warnings: securityReport.warnings,
-                        data: null,
-                      },
-                      null,
-                      2
-                    ),
-                  },
-                ],
-                isError: true,
-              },
-            });
-            return;
-          }
-
-          const alphaSignal = computeAlphaSignal(network, dexData, securityReport);
-          sendResponse({
-            jsonrpc: '2.0',
-            id: id ?? null,
-            result: {
-              content: [
-                {
-                  type: 'text',
-                  text: JSON.stringify(alphaSignal, null, 2),
-                },
-              ],
-            },
-          });
-          return;
-        }
+            ],
+            ...(status >= 400 ? { isError: true } : {}),
+          },
+        });
+        return;
       }
 
-      if (toolName === 'get_polymarket_alpha') {
-        const markets = await fetchPolymarketAlpha();
-        if (!markets) {
+      if (toolName === 'get_new_pairs_alpha') {
+        const rawNetwork = String(args.network || 'base').toLowerCase();
+        const limit = Number(args.limit) || 5;
+
+        if (!isValidNetwork(rawNetwork)) {
           sendResponse({
             jsonrpc: '2.0',
             id: id ?? null,
@@ -268,7 +227,9 @@ rl.on('line', async (line) => {
               content: [
                 {
                   type: 'text',
-                  text: JSON.stringify({ error: 'Polymarket upstream service unavailable or timed out.' }),
+                  text: JSON.stringify({
+                    error: `Unsupported network "${rawNetwork}". Supported networks: ${SUPPORTED_NETWORKS.join(', ')}`,
+                  }),
                 },
               ],
               isError: true,
@@ -277,6 +238,8 @@ rl.on('line', async (line) => {
           return;
         }
 
+        const endpointPath = `/v1/new-pairs?network=${encodeURIComponent(rawNetwork)}&limit=${encodeURIComponent(String(limit))}`;
+        const { status, data } = await callPaywalledGateway(endpointPath, paymentProof);
         sendResponse({
           jsonrpc: '2.0',
           id: id ?? null,
@@ -284,9 +247,28 @@ rl.on('line', async (line) => {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify(markets, null, 2),
+                text: JSON.stringify(data, null, 2),
               },
             ],
+            ...(status >= 400 ? { isError: true } : {}),
+          },
+        });
+        return;
+      }
+
+      if (toolName === 'get_polymarket_alpha') {
+        const { status, data } = await callPaywalledGateway('/v1/polymarket-alpha', paymentProof);
+        sendResponse({
+          jsonrpc: '2.0',
+          id: id ?? null,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(data, null, 2),
+              },
+            ],
+            ...(status >= 400 ? { isError: true } : {}),
           },
         });
         return;

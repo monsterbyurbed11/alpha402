@@ -36,6 +36,10 @@ export interface AppBindings {
 export interface AppVariables {
   paymentType: string;
   paymentProof: string;
+  paymentCostUnits?: number;
+  creditsRemainingUnits?: number;
+  creditsRemainingUsdc?: number;
+  callsRemaining?: number;
 }
 
 export interface TokenAlphaRequest {
