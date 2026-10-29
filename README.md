@@ -3,6 +3,7 @@
 [![Glama MCP Server](https://glama.ai/mcp/servers/monsterbyurbed11/alpha402/badge)](https://glama.ai/mcp/servers/monsterbyurbed11/alpha402)
 [![npm version](https://img.shields.io/npm/v/alpha402-mcp.svg)](https://www.npmjs.com/package/alpha402-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![M8ven Score](https://m8ven.ai/badge/mcp/monsterbyurbed11-alpha402-16f2fi?v=0dd7b7032645e2e041c7f79d7223fbc2)](https://m8ven.ai/mcp/monsterbyurbed11-alpha402-16f2fi?s=readme)
 
 Real-time **DexScreener** liquidity & momentum metrics, **GoPlus** fail-closed anti-honeypot smart contract security audits, newly active safe pool discovery (`/v1/new-pairs` + SSE stream), and **Polymarket** prediction market arbitrage opportunities for autonomous **AI Agents** across **Base, Solana, Ethereum, BSC, Arbitrum, and Polygon**.
 
