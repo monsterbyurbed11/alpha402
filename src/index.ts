@@ -57,7 +57,7 @@ app.get('/', async (c) => {
   await recordAnalyticsEvent({ endpoint: '/', outcome: 'DISCOVERY' }, c.env?.ALPHA402_KV);
   return c.json({
     name: 'Alpha402 - DexScreener, GoPlus Token Security & Polymarket Alpha API + MCP',
-    version: '1.6.0',
+    version: '1.7.0',
     description:
       'Real-time DEX token momentum, GoPlus anti-honeypot contract security audits, newly active safe pool discovery, and Polymarket arbitrage signals for AI agents. Includes 3 free daily MCP queries + instant prepaid Base USDC sessions & Coinbase x402.',
     paymentProtocol: 'HTTP 402 (3 Free Daily MCP Queries + Coinbase x402 + Base USDC Prepaid & Single-Call + L402 Lightning)',
@@ -368,7 +368,7 @@ app.get('/mcp', async (c) => {
   return c.json({
     status: 'ready',
     service: 'alpha402-mcp-server',
-    version: '1.6.0',
+    version: '1.7.0',
     capabilities: { tools: true },
     tools: MCP_TOOLS,
   });
@@ -395,7 +395,7 @@ async function processMcpJsonRpc(
           capabilities: { tools: {} },
           serverInfo: {
             name: 'alpha402-intelligence-mcp',
-            version: '1.6.0',
+            version: '1.7.0',
           },
         },
       },

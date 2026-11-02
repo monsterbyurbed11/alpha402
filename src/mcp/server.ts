@@ -121,7 +121,7 @@ rl.on('line', async (line) => {
           capabilities: { tools: {} },
           serverInfo: {
             name: 'alpha402-intelligence-mcp',
-            version: '1.6.0',
+            version: '1.7.0',
           },
         },
       });
