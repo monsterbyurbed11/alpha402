@@ -5,7 +5,7 @@ startCommand:
     properties:
       alpha402TxHash:
         type: string
-        description: "Optional prepaid Base USDC transaction hash (e.g. 0x...) for instant HTTP 402 credits"
+        description: "Optional prepaid Base USDC transaction hash (0x...) for unlimited bot queries. Leave blank for instant free tier."
   commandFunction: |-
     (config) => ({
       command: 'node',

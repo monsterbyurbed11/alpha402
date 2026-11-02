@@ -18,7 +18,35 @@ Real-time **DexScreener** liquidity & momentum metrics, **GoPlus** fail-closed a
 
 ## 📦 Quick Start: MCP Server (Claude Desktop, Cursor, Cline, Windsurf, Glama)
 
-Run immediately via `npx` (first **3 calls/day are 100% free**; optionally add `ALPHA402_TX_HASH` for unlimited prepaid calls):
+### Option A: Local Zero-Config (Recommended)
+Add to your `claude_desktop_config.json` or `cursor.json`. First **3 calls/day are 100% free with zero setup or wallet required**:
+
+```json
+{
+  "mcpServers": {
+    "alpha402": {
+      "command": "npx",
+      "args": ["-y", "alpha402-mcp"]
+    }
+  }
+}
+```
+
+### Option B: Remote SSE (Zero Node.js / NPM Install Required)
+Connect directly to our hosted Cloudflare Worker MCP SSE endpoint:
+
+```json
+{
+  "mcpServers": {
+    "alpha402": {
+      "url": "https://alpha402.acter.workers.dev/sse"
+    }
+  }
+}
+```
+
+### Option C: High-Frequency Trading Bots (Optional Prepaid Credits)
+If running automated trading bots (like ElizaOS) needing unlimited sub-20ms queries:
 
 ```json
 {
@@ -27,7 +55,7 @@ Run immediately via `npx` (first **3 calls/day are 100% free**; optionally add `
       "command": "npx",
       "args": ["-y", "alpha402-mcp"],
       "env": {
-        "ALPHA402_TX_HASH": "0x_OPTIONAL_PREPAID_BASE_USDC_TX_HASH"
+        "ALPHA402_TX_HASH": "0x_YOUR_PREPAID_BASE_USDC_TX_HASH"
       }
     }
   }

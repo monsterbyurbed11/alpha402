@@ -1,7 +1,7 @@
 {
-  "$schema": "https://glama.ai/mcp/glama.schema.json",
+  "$schema": "https://glama.ai/mcp/schemas/server.json",
   "name": "Alpha402 — DexScreener, GoPlus Honeypot Security & Polymarket Alpha MCP",
-  "description": "Free-to-start (3 free queries/day) real-time DEX token momentum, GoPlus anti-honeypot smart contract security audits, newly active safe pool discovery, and Polymarket arbitrage signals for Base, Solana, Ethereum, BSC, Arbitrum & Polygon. Supports instant prepaid Base USDC sessions & Coinbase x402.",
+  "description": "Free real-time DEX token momentum, GoPlus anti-honeypot smart contract security audits, newly active safe pool discovery, and Polymarket arbitrage signals for Base, Solana, Ethereum, BSC, Arbitrum & Polygon. Zero setup or wallet required to get started; optional Base USDC sessions for high-frequency bots.",
   "maintainers": [
     "monsterbyurbed11"
   ],

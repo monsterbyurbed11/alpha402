@@ -63,6 +63,9 @@ app.get('/', async (c) => {
     paymentProtocol: 'HTTP 402 (3 Free Daily MCP Queries + Coinbase x402 + Base USDC Prepaid & Single-Call + L402 Lightning)',
     endpoints: {
       mcp: '/mcp',
+      sse: '/sse',
+      mcpSse: '/mcp/sse',
+      message: '/message',
       analytics: '/v1/analytics',
       credits: '/v1/credits?txHash=0x...',
       tokenSecurity: '/v1/token-security?network=base&address=0x...',
@@ -202,7 +205,7 @@ export const MCP_TOOLS = [
     name: 'check_token_security',
     title: 'Check Token Smart Contract Security & Honeypot Status',
     description:
-      'Performs a fast, fail-closed smart contract security and anti-honeypot audit via GoPlus on Base, Solana, Ethereum, BSC, Arbitrum, or Polygon. Detects honeypots, buy/sell taxes (in % and basis points), balance modification backdoors, mint authority, and blacklists. Includes 3 free calls/day; unlimited calls cost $0.005 USDC via Base prepaid session.',
+      'Performs a fast, fail-closed smart contract security and anti-honeypot audit via GoPlus on Base, Solana, Ethereum, BSC, Arbitrum, or Polygon. Detects honeypots, buy/sell taxes (in % and basis points), balance modification backdoors, mint authority, and blacklists. Free to start with zero wallet or setup required (3 free queries/day); unlimited calls supported via optional Base prepaid session.',
     annotations: {
       title: 'Check Token Security & Honeypot Audit',
       readOnlyHint: true,
@@ -228,7 +231,7 @@ export const MCP_TOOLS = [
         paymentProof: {
           type: 'string',
           description:
-            'Optional Base USDC transaction hash ("0x...") or HTTP 402 payment header for unlimited calls after your 3 free daily queries. Deposit $1.00 USDC once on Base to 0x8a8c238ed2b46908Ff6C6922a3870984f20f8913 for 200 instant security audits.',
+            'Optional Base USDC transaction hash ("0x...") for high-frequency trading bots needing unlimited calls. Leave empty for automatic free daily queries.',
         },
       },
       required: ['address'],
@@ -239,7 +242,7 @@ export const MCP_TOOLS = [
     name: 'get_token_alpha',
     title: 'Get Token Composite AlphaScore, Momentum & Security Analysis',
     description:
-      'Computes a fail-closed composite AlphaScore (0-100) combining GoPlus smart contract security (40% weight), DexScreener 5m/1h volume momentum & buy-pressure ratio (35% weight), and USD liquidity depth (25% weight) with automatic wash-trading detection. Includes 3 free calls/day; unlimited calls cost $0.02 USDC.',
+      'Computes a fail-closed composite AlphaScore (0-100) combining GoPlus smart contract security (40% weight), DexScreener 5m/1h volume momentum & buy-pressure ratio (35% weight), and USD liquidity depth (25% weight) with automatic wash-trading detection. Free to start with zero wallet or setup required (3 free queries/day); unlimited calls supported via optional Base prepaid session.',
     annotations: {
       title: 'Get Token Composite AlphaScore & Market Signals',
       readOnlyHint: true,
@@ -265,7 +268,7 @@ export const MCP_TOOLS = [
         paymentProof: {
           type: 'string',
           description:
-            'Optional Base USDC transaction hash ("0x...") or HTTP 402 payment proof for unlimited calls after your 3 free daily queries. Deposit $1.00 USDC once on Base to 0x8a8c238ed2b46908Ff6C6922a3870984f20f8913 for 50 instant alpha calls.',
+            'Optional Base USDC transaction hash ("0x...") for high-frequency trading bots needing unlimited calls. Leave empty for automatic free daily queries.',
         },
       },
       required: ['address'],
@@ -276,7 +279,7 @@ export const MCP_TOOLS = [
     name: 'get_new_pairs_alpha',
     title: 'Discover Verified Safe New & Trending DEX Token Pairs',
     description:
-      'Scans newly active and boosted liquidity pools on Base, Solana, Ethereum, BSC, Arbitrum, or Polygon via DexScreener, automatically filters out honeypots and high-tax scams via GoPlus security audits, and returns the top verified safe pairs ranked by AlphaScore. Includes 3 free calls/day; unlimited calls cost $0.02 USDC.',
+      'Scans newly active and boosted liquidity pools on Base, Solana, Ethereum, BSC, Arbitrum, or Polygon via DexScreener, automatically filters out honeypots and high-tax scams via GoPlus security audits, and returns the top verified safe pairs ranked by AlphaScore. Free to start with zero wallet or setup required (3 free queries/day); unlimited calls supported via optional Base prepaid session.',
     annotations: {
       title: 'Discover Safe New DEX Token Pairs',
       readOnlyHint: true,
@@ -304,7 +307,7 @@ export const MCP_TOOLS = [
         paymentProof: {
           type: 'string',
           description:
-            'Optional Base USDC transaction hash ("0x...") or HTTP 402 payment proof for unlimited calls after your 3 free daily queries.',
+            'Optional Base USDC transaction hash ("0x...") for high-frequency trading bots needing unlimited calls. Leave empty for automatic free daily queries.',
         },
       },
       additionalProperties: false,
@@ -314,7 +317,7 @@ export const MCP_TOOLS = [
     name: 'get_polymarket_alpha',
     title: 'Get Polymarket High-Volume Prediction Markets & Arbitrage Spreads',
     description:
-      'Retrieves the highest-volume active prediction markets on Polymarket along with outcome probabilities, liquidity depth in USD, and binary arbitrage spreads. Includes 3 free calls/day; unlimited calls cost $0.01 USDC.',
+      'Retrieves the highest-volume active prediction markets on Polymarket along with outcome probabilities, liquidity depth in USD, and binary arbitrage spreads. Free to start with zero wallet or setup required (3 free queries/day); unlimited calls supported via optional Base prepaid session.',
     annotations: {
       title: 'Get Polymarket Prediction Market Alpha & Spreads',
       readOnlyHint: true,
@@ -328,7 +331,7 @@ export const MCP_TOOLS = [
         paymentProof: {
           type: 'string',
           description:
-            'Optional Base USDC transaction hash ("0x...") or HTTP 402 payment proof for unlimited calls after your 3 free daily queries.',
+            'Optional Base USDC transaction hash ("0x...") for high-frequency trading bots needing unlimited calls. Leave empty for automatic free daily queries.',
         },
       },
       additionalProperties: false,
@@ -336,9 +339,9 @@ export const MCP_TOOLS = [
   },
   {
     name: 'get_credits_and_payment_info',
-    title: 'Check Prepaid USDC Credit Balance & Deposit Instructions (Free)',
+    title: 'Check Prepaid USDC Credit Balance & Free Query Status (Free)',
     description:
-      '100% free utility tool with zero cost. Checks the remaining prepaid USDC credit balance and remaining call count for any Base USDC transaction hash (0x...), or returns the Base USDC deposit address and pricing tiers for upgrading from the 3 free daily calls.',
+      '100% free utility tool with zero cost. Checks remaining free queries or optional prepaid credit balance and remaining call count for any Base USDC transaction hash (0x...).',
     annotations: {
       title: 'Check Credit Balance & Payment Info (Free)',
       readOnlyHint: true,
@@ -371,18 +374,10 @@ app.get('/mcp', async (c) => {
   });
 });
 
-app.post('/mcp', async (c) => {
-  let body: any;
-  try {
-    body = await c.req.json();
-  } catch (err: any) {
-    return c.json({
-      jsonrpc: '2.0',
-      id: null,
-      error: { code: -32700, message: `Parse error: ${err?.message || 'Invalid JSON'}` },
-    });
-  }
-
+async function processMcpJsonRpc(
+  body: any,
+  c: any
+): Promise<{ status: number; response: any }> {
   const { id, method, params } = body || {};
 
   if (method === 'initialize') {
@@ -390,30 +385,36 @@ app.post('/mcp', async (c) => {
       { endpoint: '/mcp', tool: 'mcp:initialize', outcome: 'DISCOVERY' },
       c.env?.ALPHA402_KV
     );
-    return c.json({
-      jsonrpc: '2.0',
-      id: id ?? null,
-      result: {
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: {} },
-        serverInfo: {
-          name: 'alpha402-intelligence-mcp',
-          version: '1.6.0',
+    return {
+      status: 200,
+      response: {
+        jsonrpc: '2.0',
+        id: id ?? null,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: {
+            name: 'alpha402-intelligence-mcp',
+            version: '1.6.0',
+          },
         },
       },
-    });
+    };
   }
 
   if (method === 'notifications/initialized') {
-    return c.body(null, 204);
+    return { status: 204, response: null };
   }
 
   if (method === 'ping') {
-    return c.json({
-      jsonrpc: '2.0',
-      id: id ?? null,
-      result: {},
-    });
+    return {
+      status: 200,
+      response: {
+        jsonrpc: '2.0',
+        id: id ?? null,
+        result: {},
+      },
+    };
   }
 
   if (method === 'tools/list') {
@@ -421,11 +422,14 @@ app.post('/mcp', async (c) => {
       { endpoint: '/mcp', tool: 'mcp:tools/list', outcome: 'DISCOVERY' },
       c.env?.ALPHA402_KV
     );
-    return c.json({
-      jsonrpc: '2.0',
-      id: id ?? null,
-      result: { tools: MCP_TOOLS },
-    });
+    return {
+      status: 200,
+      response: {
+        jsonrpc: '2.0',
+        id: id ?? null,
+        result: { tools: MCP_TOOLS },
+      },
+    };
   }
 
   if (method === 'tools/call') {
@@ -441,11 +445,14 @@ app.post('/mcp', async (c) => {
         'get_credits_and_payment_info',
       ].includes(toolName)
     ) {
-      return c.json({
-        jsonrpc: '2.0',
-        id: id ?? null,
-        error: { code: -32601, message: `Tool not found: ${String(toolName)}` },
-      });
+      return {
+        status: 200,
+        response: {
+          jsonrpc: '2.0',
+          id: id ?? null,
+          error: { code: -32601, message: `Tool not found: ${String(toolName)}` },
+        },
+      };
     }
 
     if (toolName === 'get_credits_and_payment_info') {
@@ -463,18 +470,21 @@ app.post('/mcp', async (c) => {
         },
         c.env?.ALPHA402_KV
       );
-      return c.json({
-        jsonrpc: '2.0',
-        id: id ?? null,
-        result: {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(subData, null, 2),
-            },
-          ],
+      return {
+        status: 200,
+        response: {
+          jsonrpc: '2.0',
+          id: id ?? null,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(subData, null, 2),
+              },
+            ],
+          },
         },
-      });
+      };
     }
 
     // Validate tool arguments BEFORE charging payment proof or consuming free trial
@@ -483,60 +493,69 @@ app.post('/mcp', async (c) => {
       const address = typeof args.address === 'string' ? args.address.trim() : '';
 
       if (!isValidNetwork(rawNetwork)) {
-        return c.json({
-          jsonrpc: '2.0',
-          id: id ?? null,
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  error: `Unsupported network "${rawNetwork}". Supported networks: ${SUPPORTED_NETWORKS.join(', ')}`,
-                }),
-              },
-            ],
-            isError: true,
+        return {
+          status: 200,
+          response: {
+            jsonrpc: '2.0',
+            id: id ?? null,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    error: `Unsupported network "${rawNetwork}". Supported networks: ${SUPPORTED_NETWORKS.join(', ')}`,
+                  }),
+                },
+              ],
+              isError: true,
+            },
           },
-        });
+        };
       }
 
       if (!isValidTokenAddress(rawNetwork, address)) {
-        return c.json({
-          jsonrpc: '2.0',
-          id: id ?? null,
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  error: `Invalid token contract address "${address}" for network "${rawNetwork}".`,
-                }),
-              },
-            ],
-            isError: true,
+        return {
+          status: 200,
+          response: {
+            jsonrpc: '2.0',
+            id: id ?? null,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    error: `Invalid token contract address "${address}" for network "${rawNetwork}".`,
+                  }),
+                },
+              ],
+              isError: true,
+            },
           },
-        });
+        };
       }
     }
 
     if (toolName === 'get_new_pairs_alpha') {
       const rawNetwork = String(args.network || 'base').toLowerCase();
       if (!isValidNetwork(rawNetwork)) {
-        return c.json({
-          jsonrpc: '2.0',
-          id: id ?? null,
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  error: `Unsupported network "${rawNetwork}". Supported networks: ${SUPPORTED_NETWORKS.join(', ')}`,
-                }),
-              },
-            ],
-            isError: true,
+        return {
+          status: 200,
+          response: {
+            jsonrpc: '2.0',
+            id: id ?? null,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    error: `Unsupported network "${rawNetwork}". Supported networks: ${SUPPORTED_NETWORKS.join(', ')}`,
+                  }),
+                },
+              ],
+              isError: true,
+            },
           },
-        });
+        };
       }
     }
 
@@ -582,27 +601,137 @@ app.post('/mcp', async (c) => {
     const subRes = await app.request(internalPath, { method: 'GET', headers: subHeaders }, c.env);
     const subData = await subRes.json();
 
-    return c.json({
+    return {
+      status: 200,
+      response: {
+        jsonrpc: '2.0',
+        id: id ?? null,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(subData, null, 2),
+            },
+          ],
+          ...(subRes.status >= 500 ? { isError: true } : {}),
+        },
+      },
+    };
+  }
+
+  return {
+    status: 200,
+    response: {
       jsonrpc: '2.0',
       id: id ?? null,
-      result: {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(subData, null, 2),
-          },
-        ],
-        ...(subRes.status >= 500 ? { isError: true } : {}),
-      },
+      error: { code: -32601, message: `Method not found: ${String(method)}` },
+    },
+  };
+}
+
+// Direct HTTP JSON-RPC MCP Endpoint
+app.post('/mcp', async (c) => {
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch (err: any) {
+    return c.json({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32700, message: `Parse error: ${err?.message || 'Invalid JSON'}` },
     });
   }
 
-  return c.json({
-    jsonrpc: '2.0',
-    id: id ?? null,
-    error: { code: -32601, message: `Method not found: ${String(method)}` },
-  });
+  const { status, response } = await processMcpJsonRpc(body, c);
+  if (response === null) {
+    return c.body(null, 204);
+  }
+  return c.json(response, status as any);
 });
+
+// In-isolate active SSE streams map for standard MCP SSE transport
+const activeSseStreams = new Map<string, any>();
+
+async function handleSseConnection(c: any) {
+  await recordAnalyticsEvent({ endpoint: '/sse', outcome: 'DISCOVERY' }, c.env?.ALPHA402_KV);
+
+  return streamSSE(c, async (stream) => {
+    const sessionId = crypto.randomUUID();
+    activeSseStreams.set(sessionId, stream);
+
+    stream.onAbort(() => {
+      activeSseStreams.delete(sessionId);
+    });
+
+    const host = c.req.header('host') || 'alpha402.acter.workers.dev';
+    const proto = host.includes('localhost') ? 'http' : 'https';
+    const messageEndpoint = `${proto}://${host}/message?sessionId=${sessionId}`;
+
+    await stream.writeSSE({
+      event: 'endpoint',
+      data: messageEndpoint,
+    });
+
+    // Keep stream open with periodic keep-alive
+    while (!stream.aborted) {
+      await stream.sleep(20000);
+      try {
+        await stream.writeSSE({
+          event: 'ping',
+          data: '',
+        });
+      } catch {
+        break;
+      }
+    }
+
+    activeSseStreams.delete(sessionId);
+  });
+}
+
+async function handleMessagePost(c: any) {
+  const sessionId = c.req.query('sessionId') || '';
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch (err: any) {
+    return c.json(
+      {
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32700, message: `Parse error: ${err?.message || 'Invalid JSON'}` },
+      },
+      400
+    );
+  }
+
+  const { response, status } = await processMcpJsonRpc(body, c);
+
+  if (response === null) {
+    return c.body(null, 204);
+  }
+
+  const targetStream = sessionId ? activeSseStreams.get(sessionId) : null;
+  if (targetStream) {
+    try {
+      await targetStream.writeSSE({
+        event: 'message',
+        data: JSON.stringify(response),
+      });
+      return c.text('Accepted', 202);
+    } catch {
+      // Fall through to returning direct JSON response
+    }
+  }
+
+  return c.json(response, status as any);
+}
+
+// Standard MCP Server-Sent Events (SSE) Transport Endpoints
+app.get('/sse', handleSseConnection);
+app.get('/mcp/sse', handleSseConnection);
+app.post('/message', handleMessagePost);
+app.post('/mcp/message', handleMessagePost);
 
 // 4. OpenAPI 3.1 Specification with Complete Response Schemas (Free)
 app.get('/openapi.json', (c) => {
